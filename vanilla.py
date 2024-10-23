@@ -45,33 +45,33 @@ class VanillaPINNSolver:
         
     def compute_gradients(self, u, v, p, T, x, t):
         """Compute spatial and temporal gradients"""
-        x.requires_grad_(True)
-        t.requires_grad_(True)
+        def grad(y, x, allow_unused=False):
+            """Compute gradient of y with respect to x"""
+            grad_outputs = torch.ones_like(y)
+            grad = torch.autograd.grad(y, [x], grad_outputs=grad_outputs,
+                                     create_graph=True, allow_unused=allow_unused)[0]
+            return grad
         
-        def grad(y, x):
-            return torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y),
-                                    create_graph=True)[0]
+        # First spatial derivatives
+        u_x = grad(torch.sum(u), x, allow_unused=True)[:, 0:1]
+        u_y = grad(torch.sum(u), x, allow_unused=True)[:, 1:2]
+        v_x = grad(torch.sum(v), x, allow_unused=True)[:, 0:1]
+        v_y = grad(torch.sum(v), x, allow_unused=True)[:, 1:2]
+        T_x = grad(torch.sum(T), x, allow_unused=True)[:, 0:1]
+        T_y = grad(torch.sum(T), x, allow_unused=True)[:, 1:2]
         
-        # First derivatives
-        u_x = grad(u, x)[:, 0:1]
-        u_y = grad(u, x)[:, 1:2]
-        v_x = grad(v, x)[:, 0:1]
-        v_y = grad(v, x)[:, 1:2]
-        T_x = grad(T, x)[:, 0:1]
-        T_y = grad(T, x)[:, 1:2]
-        
-        # Second derivatives
-        u_xx = grad(u_x, x)[:, 0:1]
-        u_yy = grad(u_y, x)[:, 1:2]
-        v_xx = grad(v_x, x)[:, 0:1]
-        v_yy = grad(v_y, x)[:, 1:2]
-        T_xx = grad(T_x, x)[:, 0:1]
-        T_yy = grad(T_y, x)[:, 1:2]
+        # Second spatial derivatives
+        u_xx = grad(torch.sum(u_x), x, allow_unused=True)[:, 0:1]
+        u_yy = grad(torch.sum(u_y), x, allow_unused=True)[:, 1:2]
+        v_xx = grad(torch.sum(v_x), x, allow_unused=True)[:, 0:1]
+        v_yy = grad(torch.sum(v_y), x, allow_unused=True)[:, 1:2]
+        T_xx = grad(torch.sum(T_x), x, allow_unused=True)[:, 0:1]
+        T_yy = grad(torch.sum(T_y), x, allow_unused=True)[:, 1:2]
         
         # Time derivatives
-        u_t = grad(u, t)
-        v_t = grad(v, t)
-        T_t = grad(T, t)
+        u_t = grad(torch.sum(u), t, allow_unused=True)
+        v_t = grad(torch.sum(v), t, allow_unused=True)
+        T_t = grad(torch.sum(T), t, allow_unused=True)
         
         return u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t
 
@@ -81,8 +81,9 @@ class VanillaPINNSolver:
         
         # Inlet conditions (x = 0)
         inlet_mask = x_b[:, 0] == 0
+        u_in = self.compute_inlet_velocity()
         inlet_loss = (
-            torch.mean(torch.square(u[inlet_mask] - self.compute_inlet_velocity())) +
+            torch.mean(torch.square(u[inlet_mask] - u_in)) +
             torch.mean(torch.square(v[inlet_mask])) +
             torch.mean(torch.square(T[inlet_mask] - 300))
         )
@@ -94,7 +95,17 @@ class VanillaPINNSolver:
             torch.mean(torch.square(v[wall_mask]))
         )
         
-        return inlet_loss + wall_loss
+        # Bottom wall heat flux condition
+        bottom_wall_mask = (x_b[:, 1] == 0)
+        if torch.any(bottom_wall_mask):
+            T_grad = torch.autograd.grad(torch.sum(T[bottom_wall_mask]), x_b,
+                                       create_graph=True, allow_unused=True)[0][:, 1]
+            heat_flux_loss = torch.mean(torch.square(
+                -self.physics_loss.k * T_grad - self.Q_flux))
+        else:
+            heat_flux_loss = torch.tensor(0.0)
+        
+        return inlet_loss + wall_loss + heat_flux_loss
 
     def compute_inlet_velocity(self):
         """Compute inlet velocity based on Reynolds number"""
@@ -102,6 +113,10 @@ class VanillaPINNSolver:
 
     def train_step(self, x_domain, x_boundary, t):
         self.optimizer.zero_grad()
+        
+        # Ensure inputs require gradients
+        x_domain.requires_grad_(True)
+        t.requires_grad_(True)
         
         # Forward pass for domain points
         u, v, p, T = self.model(x_domain, t)
@@ -134,14 +149,16 @@ class VanillaPINNSolver:
         x_domain = create_domain_points(nx, ny, self.L, self.H)
         x_boundary = create_boundary_points(nx, ny, self.L, self.H)
         t = torch.zeros(x_domain.shape[0], 1)
-        history = []
+        
+        losses = []
         for epoch in range(epochs):
             loss = self.train_step(x_domain, x_boundary, t)
-            history.append(loss)
+            losses.append(loss)
             if epoch % 100 == 0:
                 print(f"Epoch {epoch}, Loss: {loss:.6f}")
-        return history
-         
+        
+        return losses
+                
     def predict(self, x, t):
         self.model.eval()
         with torch.no_grad():
