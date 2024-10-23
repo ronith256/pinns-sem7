@@ -1,483 +1,201 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, List
-from utils import *
+from typing import Tuple, Dict
 
-class StyleLayer(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+class DenseBlock(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm = nn.InstanceNorm2d(out_channels)
+        self.layers = nn.ModuleList()
         
-        # Initialize weights
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        """Initialize network weights for better convergence"""
-        if isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+        # Input layer
+        self.layers.append(nn.Linear(input_dim, hidden_dim))
         
+        # Hidden layers with skip connections
+        for _ in range(num_layers - 1):
+            self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+            
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        try:
-            x = self.conv(x)
-            x = self.norm(x)
-            return F.relu(x)
-        except RuntimeError as e:
-            print(f"Error in StyleLayer forward pass: {str(e)}")
-            return torch.zeros_like(x)
+        h = x
+        for layer in self.layers:
+            h_new = F.silu(layer(h))  # Using SiLU (Swish) activation
+            h = h_new + h if h.shape == h_new.shape else h_new
+        return h
 
 class NSFNet(nn.Module):
-    def __init__(self, input_channels: int = 3, H: int = 51, W: int = 501):
+    def __init__(self, domain_params: Dict[str, float]):
         super().__init__()
-        self.H = H
-        self.W = W
-        
-        # Encoder
-        self.enc1 = StyleLayer(input_channels, 64)
-        self.enc2 = StyleLayer(64, 128)
-        self.enc3 = StyleLayer(128, 256)
-        
-        # Flow-specific layers with residual connections
-        self.flow1 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.flow2 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.flow_norm = nn.InstanceNorm2d(256)
-        
-        # Decoder with skip connections
-        self.dec3 = StyleLayer(256 + 128, 128)  # Added input channels for skip connection
-        self.dec2 = StyleLayer(128 + 64, 64)    # Added input channels for skip connection
-        self.dec1 = nn.Conv2d(64, 4, kernel_size=3, padding=1)  # 4 channels for u, v, p, T
-        
-        # Dropout for regularization
-        self.dropout = nn.Dropout2d(0.1)
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        """Initialize network weights for better convergence"""
-        if isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-                
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        try:
-            # Ensure inputs are on the correct device
-            device = next(self.parameters()).device
-            x = x.to(device)
-            t = t.to(device)
-            
-            # Reshape input to match convolution expectations
-            batch_size = x.shape[0]
-            x = x.reshape(batch_size, -1, self.H, self.W)
-            t = t.reshape(batch_size, 1, 1, 1).expand(-1, -1, self.H, self.W)
-            x = torch.cat([x, t], dim=1)
-            
-            # Encoder with skip connections
-            e1 = self.enc1(x)
-            e1 = self.dropout(e1)
-            
-            e2 = self.enc2(e1)
-            e2 = self.dropout(e2)
-            
-            e3 = self.enc3(e2)
-            e3 = self.dropout(e3)
-            
-            # Flow processing with residual connection
-            f = F.relu(self.flow_norm(self.flow1(e3)))
-            f = F.relu(self.flow_norm(self.flow2(f)))
-            f = f + e3  # Residual connection
-            
-            # Decoder with skip connections
-            d3 = self.dec3(torch.cat([f, e2], dim=1))
-            d2 = self.dec2(torch.cat([d3, e1], dim=1))
-            d1 = self.dec1(d2)
-            
-            # Check for numerical issues
-            if check_nan_inf(d1, "decoder_output"):
-                raise ValueError("NaN or Inf values detected in network output")
-            
-            # Split outputs and reshape
-            u = d1[:, 0:1].reshape(batch_size, -1)
-            v = d1[:, 1:2].reshape(batch_size, -1)
-            p = d1[:, 2:3].reshape(batch_size, -1)
-            T = d1[:, 3:4].reshape(batch_size, -1)
-            
-            return u, v, p, T
-            
-        except Exception as e:
-            print(f"Error in NSFNet forward pass: {str(e)}")
-            zeros = torch.zeros(x.shape[0], 1, device=device)
-            return zeros, zeros, zeros, zeros
-
-class NSFNetSolver:
-    def __init__(self, domain_params: dict, physics_params: dict):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Store parameters
         self.L = domain_params['L']
         self.H = domain_params['H']
-        self.Re = domain_params['Re']
-        self.Q_flux = domain_params['Q_flux']
         
-        # Initialize model and move to device
-        self.model = NSFNet().to(self.device)
-        self.physics_loss = PhysicsLoss(**physics_params).to(self.device)
+        # Physical parameters
+        self.rho = 997.07  # Density
+        self.mu = 8.9e-4   # Dynamic viscosity
+        self.k = 0.606     # Thermal conductivity
+        self.cp = 4200     # Specific heat capacity
+        self.Q_flux = 20000  # Heat flux
         
-        # Initialize optimizer with gradient clipping
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=1e-4,
-            weight_decay=1e-5,
-            betas=(0.9, 0.999),
-            eps=1e-8
+        # Network architecture
+        input_dim = 3  # x, y, t
+        hidden_dim = 64
+        num_dense_layers = 4
+        
+        # Encoding blocks
+        self.encoder = nn.ModuleList([
+            DenseBlock(input_dim, hidden_dim, num_dense_layers),
+            DenseBlock(hidden_dim, hidden_dim, num_dense_layers)
+        ])
+        
+        # Decoding heads for u, v, p, T
+        self.u_head = nn.Linear(hidden_dim, 1)
+        self.v_head = nn.Linear(hidden_dim, 1)
+        self.p_head = nn.Linear(hidden_dim, 1)
+        self.T_head = nn.Linear(hidden_dim, 1)
+        
+        # Move model to GPU if available
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.to(self.device)
+        
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        # Normalize inputs
+        x_norm = x[:, 0:1] / self.L
+        y_norm = x[:, 1:2] / self.H
+        t_norm = t / 30.0  # Normalize time by simulation duration
+        
+        # Combine inputs
+        inputs = torch.cat([x_norm, y_norm, t_norm], dim=1)
+        
+        # Forward pass through encoder blocks
+        h = inputs
+        for block in self.encoder:
+            h = block(h)
+        
+        # Generate outputs through heads
+        u = self.u_head(h)
+        v = self.v_head(h)
+        p = self.p_head(h)
+        T = self.T_head(h)
+        
+        return u, v, p, T
+    
+    def compute_pde_residuals(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Compute PDE residuals for physics-informed training."""
+        x.requires_grad_(True)
+        t.requires_grad_(True)
+        
+        u, v, p, T = self.forward(x, t)
+        
+        # Calculate gradients
+        grad_outputs = tuple(torch.ones_like(output) for output in (u, v, p, T))
+        derivatives = torch.autograd.grad(
+            outputs=(u, v, p, T),
+            inputs=(x, t),
+            grad_outputs=grad_outputs,
+            create_graph=True
         )
         
-        # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=500,
-            verbose=True,
-            min_lr=1e-6
-        )
+        # Spatial derivatives
+        dx = derivatives[0]
+        dt = derivatives[1]
         
-        # Initialize loss weights
-        self.loss_weights = {
-            'continuity': 1.0,
-            'momentum_x': 1.0,
-            'momentum_y': 1.0,
-            'energy': 1.0,
-            'boundary': 1.0
-        }
+        # Extract individual derivatives
+        u_x = dx[:, 0:1, 0:1]
+        u_y = dx[:, 0:1, 1:2]
+        v_x = dx[:, 1:2, 0:1]
+        v_y = dx[:, 1:2, 1:2]
+        p_x = dx[:, 2:3, 0:1]
+        p_y = dx[:, 2:3, 1:2]
+        T_x = dx[:, 3:4, 0:1]
+        T_y = dx[:, 3:4, 1:2]
         
-    def to(self, device: torch.device) -> 'NSFNetSolver':
-        """Move solver to specified device"""
-        self.device = device
-        self.model = self.model.to(device)
-        self.physics_loss = self.physics_loss.to(device)
-        return self
-
-    def compute_gradients(self, u: torch.Tensor, v: torch.Tensor,
-                         p: torch.Tensor, T: torch.Tensor,
-                         x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Compute spatial and temporal gradients with proper device handling"""
-        x = x.requires_grad_(True)
-        t = t.requires_grad_(True)
+        # Time derivatives
+        u_t = dt[:, 0:1]
+        v_t = dt[:, 1:2]
+        T_t = dt[:, 3:4]
         
-        try:
-            def grad(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-                """Helper function for gradient computation"""
-                return compute_gradient(y, x, allow_unused=True)
-            
-            # First derivatives
-            u_x = grad(u.sum(), x)[:, 0:1]
-            u_y = grad(u.sum(), x)[:, 1:2]
-            v_x = grad(v.sum(), x)[:, 0:1]
-            v_y = grad(v.sum(), x)[:, 1:2]
-            T_x = grad(T.sum(), x)[:, 0:1]
-            T_y = grad(T.sum(), x)[:, 1:2]
-            
-            # Second derivatives
-            u_xx = grad(u_x.sum(), x)[:, 0:1]
-            u_yy = grad(u_y.sum(), x)[:, 1:2]
-            v_xx = grad(v_x.sum(), x)[:, 0:1]
-            v_yy = grad(v_y.sum(), x)[:, 1:2]
-            T_xx = grad(T_x.sum(), x)[:, 0:1]
-            T_yy = grad(T_y.sum(), x)[:, 1:2]
-            
-            # Time derivatives
-            u_t = grad(u.sum(), t)
-            v_t = grad(v.sum(), t)
-            T_t = grad(T.sum(), t)
-            
-            return u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t
-            
-        except Exception as e:
-            print(f"Error computing gradients: {str(e)}")
-            zeros = torch.zeros_like(x[:, 0:1])
-            return tuple([zeros] * 15)
-
-    def boundary_loss(self, x_b: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Compute boundary condition loss with device handling"""
-        x_b = x_b.to(self.device).requires_grad_(True)
-        t = t.to(self.device).requires_grad_(True)
+        # Compute residuals
+        # Continuity equation
+        res_continuity = u_x + v_y
         
-        try:
-            u, v, p, T = self.model(x_b, t)
-            
-            # Inlet conditions (x = 0)
-            inlet_mask = (x_b[:, 0] == 0)
-            u_in = self.compute_inlet_velocity()
-            inlet_loss = (
-                torch.mean(torch.square(u[inlet_mask] - u_in)) +
-                torch.mean(torch.square(v[inlet_mask])) +
-                torch.mean(torch.square(T[inlet_mask] - 300))
-            )
-            
-            # Wall conditions (y = 0 or y = H)
-            wall_mask = (x_b[:, 1] == 0) | (x_b[:, 1] == self.H)
-            wall_loss = (
-                torch.mean(torch.square(u[wall_mask])) +
-                torch.mean(torch.square(v[wall_mask]))
-            )
-            
-            # Bottom wall heat flux condition
-            bottom_wall_mask = (x_b[:, 1] == 0)
-            if torch.any(bottom_wall_mask):
-                T_masked = T[bottom_wall_mask]
-                if T_masked.requires_grad:
-                    T_grad = compute_gradient(T_masked.sum(), x_b, allow_unused=True)
-                    if T_grad is not None:
-                        heat_flux_loss = torch.mean(torch.square(
-                            -self.physics_loss.k * T_grad[:, 1] - self.Q_flux
-                        ))
-                    else:
-                        heat_flux_loss = torch.tensor(0.0, device=self.device)
-                else:
-                    heat_flux_loss = torch.tensor(0.0, device=self.device)
-            else:
-                heat_flux_loss = torch.tensor(0.0, device=self.device)
-            
-            return inlet_loss + wall_loss + heat_flux_loss
-            
-        except Exception as e:
-            print(f"Error computing boundary loss: {str(e)}")
-            return torch.tensor(float('inf'), device=self.device)
-
-    def compute_inlet_velocity(self) -> torch.Tensor:
-        """Compute inlet velocity based on Reynolds number"""
-        return (self.Re * self.physics_loss.mu / 
-                (self.physics_loss.rho * self.H)).to(self.device)
-
-    def train_step(self, x_domain: torch.Tensor, x_boundary: torch.Tensor,
-                  t_domain: torch.Tensor, t_boundary: torch.Tensor) -> dict:
-        """Perform one training step with proper device handling and detailed loss tracking"""
-        self.model.train()
-        self.optimizer.zero_grad()
+        # Momentum equations
+        nu = self.mu / self.rho
+        res_momentum_x = u_t + u * u_x + v * u_y + (1/self.rho) * p_x - nu * (u_x * u_x + u_y * u_y)
+        res_momentum_y = v_t + u * v_x + v * v_y + (1/self.rho) * p_y - nu * (v_x * v_x + v_y * v_y)
         
-        # Move inputs to device
-        x_domain = x_domain.to(self.device)
-        t_domain = t_domain.to(self.device)
-        x_boundary = x_boundary.to(self.device)
-        t_boundary = t_boundary.to(self.device)
+        # Energy equation
+        alpha = self.k / (self.rho * self.cp)
+        res_energy = T_t + u * T_x + v * T_y - alpha * (T_x * T_x + T_y * T_y)
         
-        try:
-            # Forward pass
-            u, v, p, T = self.model(x_domain, t_domain)
-            
-            # Check for numerical issues
-            if any(check_nan_inf(tensor, name) 
-                  for tensor, name in zip([u, v, p, T], ['u', 'v', 'p', 'T'])):
-                raise ValueError("NaN or Inf values detected in model outputs")
-            
-            # Compute gradients
-            grads = self.compute_gradients(u, v, p, T, x_domain, t_domain)
-            u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t = grads
-            
-            # Compute individual losses with weights
-            losses = {
-                'continuity': self.loss_weights['continuity'] * self.physics_loss.continuity_loss(
-                    u, v, lambda x: u_x, lambda x: v_y),
-                'momentum_x': self.loss_weights['momentum_x'] * self.physics_loss.momentum_x_loss(
-                    u, v, p, lambda x: u_x, lambda x: u_y,
-                    lambda x: u_xx, lambda x: u_yy, u_t),
-                'momentum_y': self.loss_weights['momentum_y'] * self.physics_loss.momentum_y_loss(
-                    u, v, p, lambda x: v_x, lambda x: v_y,
-                    lambda x: v_xx, lambda x: v_yy, v_t),
-                'energy': self.loss_weights['energy'] * self.physics_loss.energy_loss(
-                    T, u, v, lambda x: T_x, lambda x: T_y,
-                    lambda x: T_xx, lambda x: T_yy, T_t),
-                'boundary': self.loss_weights['boundary'] * self.boundary_loss(x_boundary, t_boundary)
-            }
-            
-            # Compute total loss
-            total_loss = sum(losses.values())
-            
-            # Backward pass with gradient clipping
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            # Optimizer step
-            self.optimizer.step()
-            
-            # Update learning rate
-            self.scheduler.step(total_loss)
-            
-            # Convert losses to float for logging
-            losses = {k: v.item() for k, v in losses.items()}
-            losses['total'] = total_loss.item()
-            
-            return losses
-            
-        except Exception as e:
-            print(f"Error in training step: {str(e)}")
-            return {k: float('inf') for k in ['continuity', 'momentum_x', 'momentum_y', 
-                                            'energy', 'boundary', 'total']}
-
-    def train(self, epochs: int, nx: int = 501, ny: int = 51,
-              validation_freq: int = 100) -> Tuple[List[dict], List[dict]]:
-        """Train the model with validation and early stopping"""
-        try:
-            # Create domain and boundary points
-            x_domain = create_domain_points(nx, ny, self.L, self.H, self.device)
-            x_boundary = create_boundary_points(nx, ny, self.L, self.H, self.device)
-            
-            # Create time tensors
-            t_domain = torch.zeros(x_domain.shape[0], 1, device=self.device)
-            t_boundary = torch.zeros(x_boundary.shape[0], 1, device=self.device)
-            
-            # Create validation points (using a subset of domain points)
-            val_indices = torch.randperm(x_domain.shape[0])[:1000]
-            x_val = x_domain[val_indices]
-            t_val = t_domain[val_indices]
-            
-            # Initialize tracking variables
-            train_history = []
-            val_history = []
-            best_val_loss = float('inf')
-            patience = 1000
-            patience_counter = 0
-            
-            for epoch in range(epochs):
-                # Training step
-                train_losses = self.train_step(x_domain, x_boundary, t_domain, t_boundary)
-                train_history.append(train_losses)
-                
-                # Validation step
-                if epoch % validation_freq == 0:
-                    val_losses = self.validate(x_val, t_val)
-                    val_history.append(val_losses)
-                    
-                    # Early stopping check
-                    if val_losses['total'] < best_val_loss:
-                        best_val_loss = val_losses['total']
-                        patience_counter = 0
-                    else:
-                        patience_counter += 1
-                    
-                    # Print progress
-                    print(f"Epoch {epoch}")
-                    print(f"Training Loss: {train_losses['total']:.6f}")
-                    print(f"Validation Loss: {val_losses['total']:.6f}")
-                    print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.2e}")
-                
-                # Check stopping conditions
-                if patience_counter >= patience:
-                    print("Early stopping triggered")
-                    break
-                
-                if train_losses['total'] > 1e5:
-                    print("Training diverged")
-                    break
-            
-            return train_history, val_history
-            
-        except Exception as e:
-            print(f"Error in training: {str(e)}")
-            return [], []
-
-    def validate(self, x_val: torch.Tensor, t_val: torch.Tensor) -> dict:
-        """Validate model performance"""
-        self.model.eval()
-        try:
-            with torch.no_grad():
-                x_val = x_val.to(self.device)
-                t_val = t_val.to(self.device)
-                
-                # Forward pass
-                u, v, p, T = self.model(x_val, t_val)
-                
-                # Compute gradients for validation
-                grads = self.compute_gradients(u, v, p, T, x_val, t_val)
-                u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t = grads
-                
-                # Compute individual losses
-                losses = {
-                    'continuity': self.physics_loss.continuity_loss(
-                        u, v, lambda x: u_x, lambda x: v_y).item(),
-                    'momentum_x': self.physics_loss.momentum_x_loss(
-                        u, v, p, lambda x: u_x, lambda x: u_y,
-                        lambda x: u_xx, lambda x: u_yy, u_t).item(),
-                    'momentum_y': self.physics_loss.momentum_y_loss(
-                        u, v, p, lambda x: v_x, lambda x: v_y,
-                        lambda x: v_xx, lambda x: v_yy, v_t).item(),
-                    'energy': self.physics_loss.energy_loss(
-                        T, u, v, lambda x: T_x, lambda x: T_y,
-                        lambda x: T_xx, lambda x: T_yy, T_t).item()
-                }
-                
-                losses['total'] = sum(losses.values())
-                return losses
-                
-        except Exception as e:
-            print(f"Error in validation: {str(e)}")
-            return {k: float('inf') for k in ['continuity', 'momentum_x', 'momentum_y', 
-                                            'energy', 'total']}
-
+        return torch.cat([
+            res_continuity,
+            res_momentum_x,
+            res_momentum_y,
+            res_energy
+        ], dim=1)
+    
+    def compute_bc_residuals(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Compute boundary condition residuals."""
+        # Inlet conditions (x = 0)
+        inlet_mask = x[:, 0] < 1e-5
+        u_in = 200 * self.mu / (self.rho * 0.00116)  # Based on Re = 200
+        inlet_res = torch.zeros_like(x[:, 0:1])
+        if inlet_mask.any():
+            u, v, _, T = self.forward(x[inlet_mask], t[inlet_mask])
+            inlet_res[inlet_mask] = torch.cat([
+                u - u_in,
+                v,
+                T - 300.0
+            ], dim=1)
+        
+        # Wall conditions (y = 0 or y = H)
+        wall_mask = (x[:, 1] < 1e-5) | (torch.abs(x[:, 1] - self.H) < 1e-5)
+        wall_res = torch.zeros_like(x[:, 0:1])
+        if wall_mask.any():
+            u, v, _, _ = self.forward(x[wall_mask], t[wall_mask])
+            wall_res[wall_mask] = torch.cat([u, v], dim=1)
+        
+        return torch.cat([inlet_res, wall_res], dim=1)
+    
     def predict(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Make predictions with proper device handling"""
-        self.model.eval()
-        try:
-            with torch.no_grad():
-                x = x.to(self.device)
-                t = t.to(self.device)
-                u, v, p, T = self.model(x, t)
-                
-                # Check for numerical issues
-                if any(check_nan_inf(tensor, name) 
-                      for tensor, name in zip([u, v, p, T], ['u', 'v', 'p', 'T'])):
-                    raise ValueError("NaN or Inf values detected in predictions")
-                
-                return u, v, p, T
-                
-        except Exception as e:
-            print(f"Error in prediction: {str(e)}")
-            zeros = torch.zeros(x.shape[0], 1, device=self.device)
-            return zeros, zeros, zeros, zeros
+        """Make predictions for visualization."""
+        return self.forward(x, t)
 
-    def save_model(self, path: str):
-        """Save model state with error handling"""
-        try:
-            torch.save({
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'loss_weights': self.loss_weights,
-                'device': self.device,
-                'domain_params': {
-                    'L': self.L,
-                    'H': self.H,
-                    'Re': self.Re,
-                    'Q_flux': self.Q_flux
-                }
-            }, path)
-            print(f"Model saved successfully to {path}")
-        except Exception as e:
-            print(f"Error saving model: {str(e)}")
-
-    def load_model(self, path: str):
-        """Load model state with error handling"""
-        try:
-            checkpoint = torch.load(path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            self.loss_weights = checkpoint['loss_weights']
-            
-            # Load domain parameters
-            params = checkpoint['domain_params']
-            self.L = params['L']
-            self.H = params['H']
-            self.Re = params['Re']
-            self.Q_flux = params['Q_flux']
-            
-            # Move model to correct device
-            self.to(self.device)
-            print(f"Model loaded successfully from {path}")
-        except Exception as e:
-            print(f"Error loading model: {str(e)}")
+def train_nsfnet(model: NSFNet, num_epochs: int = 1000) -> NSFNet:
+    """Train the NSFNet model."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+    
+    # Generate training points
+    num_points = 10000
+    x = torch.linspace(0, model.L, 100, device=model.device)
+    y = torch.linspace(0, model.H, 50, device=model.device)
+    t = torch.linspace(0, 30, 30, device=model.device)
+    
+    X, Y, T = torch.meshgrid(x, y, t, indexing='ij')
+    training_points = torch.stack([X.flatten(), Y.flatten()], dim=1)
+    training_times = T.flatten().unsqueeze(1)
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        optimizer.zero_grad()
+        
+        # Compute losses
+        pde_residuals = model.compute_pde_residuals(training_points, training_times)
+        bc_residuals = model.compute_bc_residuals(training_points, training_times)
+        
+        pde_loss = torch.mean(torch.square(pde_residuals))
+        bc_loss = torch.mean(torch.square(bc_residuals))
+        
+        total_loss = pde_loss + bc_loss
+        
+        # Backpropagation
+        total_loss.backward()
+        optimizer.step()
+        
+        # Update learning rate
+        scheduler.step(total_loss)
+        
+        if (epoch + 1) % 100 == 0:
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss.item():.6f}")
+    
+    return model
