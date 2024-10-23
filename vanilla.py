@@ -1,216 +1,240 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Dict, Any
 
-class LaminarFlowPINN(nn.Module):
-    def __init__(self, domain_params: dict):
+class FlowPINN(nn.Module):
+    def __init__(self, domain_params: Dict[str, Any]):
         super().__init__()
-        # Domain parameters
-        self.L = domain_params['L']
-        self.H = domain_params['H']
-        self.Re = domain_params['Re']
-        self.Dh = domain_params['Dh']
         
         # Physical parameters
-        self.rho = 997.07  # Density
+        self.rho = 997.07  # Density of water
         self.mu = 8.9e-4   # Dynamic viscosity
         self.nu = self.mu / self.rho  # Kinematic viscosity
         self.k = 0.606     # Thermal conductivity
         self.cp = 4200     # Specific heat capacity
-        self.Q_flux = 20000  # Heat flux
-        self.T0 = 300      # Initial temperature
+        self.q_flux = 20000  # Heat flux
+        
+        # Domain parameters
+        self.L = domain_params['L']
+        self.H = domain_params['H']
+        self.Re = 200      # Reynolds number
+        
+        # Calculate inlet velocity from Reynolds number
+        self.Dh = 0.00116  # Hydraulic diameter
+        self.U_in = (self.Re * self.mu) / (self.rho * self.Dh)
         
         # Neural network architecture
-        self.net = nn.Sequential(
-            nn.Linear(3, 64),  # Input: (x, y, t)
-            nn.Tanh(),
-            nn.Linear(64, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
-            nn.Linear(128, 64),
-            nn.Tanh(),
-            nn.Linear(64, 4)   # Output: (u, v, p, T)
-        )
-        
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.to(self.device)
+        self.net = nn.Sequential(
+            nn.Linear(3, 128),  # Input: (x, y, t)
+            nn.Tanh(),
+            nn.Linear(128, 256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.Tanh(),
+            nn.Linear(256, 128),
+            nn.Tanh(),
+            nn.Linear(128, 4)   # Output: (u, v, p, T)
+        ).to(self.device)
     
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        # Combine inputs
         inputs = torch.cat([x, t], dim=1)
         outputs = self.net(inputs)
-        return outputs
+        
+        return (outputs[:, 0:1],   # u velocity
+                outputs[:, 1:2],   # v velocity
+                outputs[:, 2:3],   # pressure
+                outputs[:, 3:4])   # temperature
     
     def predict(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Forward pass with separate outputs"""
-        outputs = self.forward(x, t)
-        return outputs[:, 0], outputs[:, 1], outputs[:, 2], outputs[:, 3]
+        self.eval()
+        with torch.no_grad():
+            return self.forward(x, t)
     
-    def compute_derivatives(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Compute spatial and temporal derivatives using autograd"""
-        inputs = torch.cat([x, t], dim=1)
-        inputs.requires_grad_(True)
+    def compute_derivatives(self, x: torch.Tensor, t: torch.Tensor) -> Dict[str, torch.Tensor]:
+        x.requires_grad_(True)
+        t.requires_grad_(True)
         
-        outputs = self.net(inputs)
-        u, v, p, T = outputs[:, 0], outputs[:, 1], outputs[:, 2], outputs[:, 3]
+        u, v, p, T = self.forward(x, t)
         
         # First derivatives
-        grads = torch.autograd.grad(
-            [u.sum(), v.sum(), p.sum(), T.sum()],
-            inputs,
-            create_graph=True
-        )
+        u_x = torch.autograd.grad(u.sum(), x, create_graph=True)[0][:, 0:1]
+        u_y = torch.autograd.grad(u.sum(), x, create_graph=True)[0][:, 1:2]
+        u_t = torch.autograd.grad(u.sum(), t, create_graph=True)[0]
         
-        u_x = grads[0][:, 0]
-        u_y = grads[0][:, 1]
-        u_t = grads[0][:, 2]
+        v_x = torch.autograd.grad(v.sum(), x, create_graph=True)[0][:, 0:1]
+        v_y = torch.autograd.grad(v.sum(), x, create_graph=True)[0][:, 1:2]
+        v_t = torch.autograd.grad(v.sum(), t, create_graph=True)[0]
         
-        v_x = grads[1][:, 0]
-        v_y = grads[1][:, 1]
-        v_t = grads[1][:, 2]
+        p_x = torch.autograd.grad(p.sum(), x, create_graph=True)[0][:, 0:1]
+        p_y = torch.autograd.grad(p.sum(), x, create_graph=True)[0][:, 1:2]
         
-        p_x = grads[2][:, 0]
-        p_y = grads[2][:, 1]
-        
-        T_x = grads[3][:, 0]
-        T_y = grads[3][:, 1]
-        T_t = grads[3][:, 2]
+        T_x = torch.autograd.grad(T.sum(), x, create_graph=True)[0][:, 0:1]
+        T_y = torch.autograd.grad(T.sum(), x, create_graph=True)[0][:, 1:2]
+        T_t = torch.autograd.grad(T.sum(), t, create_graph=True)[0]
         
         # Second derivatives
-        u_xx = torch.autograd.grad(u_x.sum(), inputs, create_graph=True)[0][:, 0]
-        u_yy = torch.autograd.grad(u_y.sum(), inputs, create_graph=True)[0][:, 1]
+        u_xx = torch.autograd.grad(u_x.sum(), x, create_graph=True)[0][:, 0:1]
+        u_yy = torch.autograd.grad(u_y.sum(), x, create_graph=True)[0][:, 1:2]
         
-        v_xx = torch.autograd.grad(v_x.sum(), inputs, create_graph=True)[0][:, 0]
-        v_yy = torch.autograd.grad(v_y.sum(), inputs, create_graph=True)[0][:, 1]
+        v_xx = torch.autograd.grad(v_x.sum(), x, create_graph=True)[0][:, 0:1]
+        v_yy = torch.autograd.grad(v_y.sum(), x, create_graph=True)[0][:, 1:2]
         
-        T_xx = torch.autograd.grad(T_x.sum(), inputs, create_graph=True)[0][:, 0]
-        T_yy = torch.autograd.grad(T_y.sum(), inputs, create_graph=True)[0][:, 1]
+        T_xx = torch.autograd.grad(T_x.sum(), x, create_graph=True)[0][:, 0:1]
+        T_yy = torch.autograd.grad(T_y.sum(), x, create_graph=True)[0][:, 1:2]
         
-        return (u, v, p, T, 
-                u_x, u_y, u_t, v_x, v_y, v_t, p_x, p_y, T_x, T_y, T_t,
-                u_xx, u_yy, v_xx, v_yy, T_xx, T_yy)
+        return {
+            'u': u, 'v': v, 'p': p, 'T': T,
+            'u_x': u_x, 'u_y': u_y, 'u_t': u_t,
+            'v_x': v_x, 'v_y': v_y, 'v_t': v_t,
+            'p_x': p_x, 'p_y': p_y,
+            'T_x': T_x, 'T_y': T_y, 'T_t': T_t,
+            'u_xx': u_xx, 'u_yy': u_yy,
+            'v_xx': v_xx, 'v_yy': v_yy,
+            'T_xx': T_xx, 'T_yy': T_yy
+        }
     
-    def compute_pde_residuals(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Compute residuals for all governing equations"""
-        derivatives = self.compute_derivatives(x, t)
-        (u, v, p, T, 
-         u_x, u_y, u_t, v_x, v_y, v_t, p_x, p_y, T_x, T_y, T_t,
-         u_xx, u_yy, v_xx, v_yy, T_xx, T_yy) = derivatives
+    def compute_pde_residuals(self, x: torch.Tensor, t: torch.Tensor) -> Dict[str, torch.Tensor]:
+        d = self.compute_derivatives(x, t)
         
         # Continuity equation
-        continuity = u_x + v_y
+        continuity = d['u_x'] + d['v_y']
         
         # Momentum equations
-        momentum_x = (u_t + u * u_x + v * u_y + 
-                     (1/self.rho) * p_x - self.nu * (u_xx + u_yy))
+        momentum_x = (d['u_t'] + d['u']*d['u_x'] + d['v']*d['u_y'] + 
+                     (1/self.rho)*d['p_x'] - self.nu*(d['u_xx'] + d['u_yy']))
         
-        momentum_y = (v_t + u * v_x + v * v_y + 
-                     (1/self.rho) * p_y - self.nu * (v_xx + v_yy))
+        momentum_y = (d['v_t'] + d['u']*d['v_x'] + d['v']*d['v_y'] + 
+                     (1/self.rho)*d['p_y'] - self.nu*(d['v_xx'] + d['v_yy']))
         
         # Energy equation
-        energy = (self.rho * self.cp * (T_t + u * T_x + v * T_y) - 
-                 self.k * (T_xx + T_yy))
+        energy = (d['T_t'] + d['u']*d['T_x'] + d['v']*d['T_y'] - 
+                 (self.k/(self.rho*self.cp))*(d['T_xx'] + d['T_yy']))
         
-        return continuity, momentum_x, momentum_y, energy
+        return {
+            'continuity': continuity,
+            'momentum_x': momentum_x,
+            'momentum_y': momentum_y,
+            'energy': energy
+        }
     
-    def compute_bc_residuals(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Compute residuals for boundary conditions"""
-        # Get all variables and derivatives
-        derivatives = self.compute_derivatives(x, t)
-        (u, v, p, T, 
-         u_x, u_y, u_t, v_x, v_y, v_t, p_x, p_y, T_x, T_y, T_t,
-         u_xx, u_yy, v_xx, v_yy, T_xx, T_yy) = derivatives
-        
-        # Calculate inlet velocity based on Reynolds number
-        u_in = self.Re * self.mu / (self.rho * self.Dh)
-        
-        # Create masks for different boundaries
-        inlet_mask = torch.abs(x[:, 0]) < 1e-5
-        outlet_mask = torch.abs(x[:, 0] - self.L) < 1e-5
-        bottom_mask = torch.abs(x[:, 1]) < 1e-5
-        top_mask = torch.abs(x[:, 1] - self.H) < 1e-5
+    def compute_bc_residuals(self, x: torch.Tensor, t: torch.Tensor) -> Dict[str, torch.Tensor]:
+        d = self.compute_derivatives(x, t)
         
         # Inlet conditions (x = 0)
-        inlet_u = (u - u_in) * inlet_mask
-        inlet_v = v * inlet_mask
-        inlet_T = (T - self.T0) * inlet_mask
-        inlet_p = (p - 101325) * inlet_mask  # Reference pressure
+        inlet_mask = x[:, 0:1] < 1e-5
+        inlet_u = d['u'] - self.U_in * torch.ones_like(d['u'])
+        inlet_v = d['v']
+        inlet_T = d['T'] - 300.0
         
         # Outlet conditions (x = L)
-        outlet_u = u_x * outlet_mask
-        outlet_v = v_x * outlet_mask
-        outlet_T = T_x * outlet_mask
-        outlet_p = p_x * outlet_mask
+        outlet_mask = torch.abs(x[:, 0:1] - self.L) < 1e-5
+        outlet_u = d['u_x']
+        outlet_v = d['v_x']
+        outlet_T = d['T_x']
         
         # Bottom wall conditions (y = 0)
-        bottom_u = u * bottom_mask
-        bottom_v = v * bottom_mask
-        bottom_T = (self.k * T_y + self.Q_flux) * bottom_mask
-        bottom_p = p_y * bottom_mask
+        bottom_mask = x[:, 1:2] < 1e-5
+        bottom_u = d['u']
+        bottom_v = d['v']
+        bottom_T = -self.k * d['T_y'] - self.q_flux
         
         # Top wall conditions (y = H)
-        top_u = u * top_mask
-        top_v = v * top_mask
-        top_T = T_y * top_mask
-        top_p = p_y * top_mask
+        top_mask = torch.abs(x[:, 1:2] - self.H) < 1e-5
+        top_u = d['u']
+        top_v = d['v']
+        top_T = d['T_y']
         
-        return (
-            inlet_u, inlet_v, inlet_T, inlet_p,
-            outlet_u, outlet_v, outlet_T, outlet_p,
-            bottom_u, bottom_v, bottom_T, bottom_p,
-            top_u, top_v, top_T, top_p
-        )
+        return {
+            'inlet_u': inlet_u * inlet_mask,
+            'inlet_v': inlet_v * inlet_mask,
+            'inlet_T': inlet_T * inlet_mask,
+            'outlet_u': outlet_u * outlet_mask,
+            'outlet_v': outlet_v * outlet_mask,
+            'outlet_T': outlet_T * outlet_mask,
+            'bottom_u': bottom_u * bottom_mask,
+            'bottom_v': bottom_v * bottom_mask,
+            'bottom_T': bottom_T * bottom_mask,
+            'top_u': top_u * top_mask,
+            'top_v': top_v * top_mask,
+            'top_T': top_T * top_mask
+        }
     
-    def loss_fn(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Compute total loss"""
+    def compute_loss(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # PDE residuals
-        continuity, momentum_x, momentum_y, energy = self.compute_pde_residuals(x, t)
-        pde_loss = (torch.mean(continuity**2) + 
-                   torch.mean(momentum_x**2) + 
-                   torch.mean(momentum_y**2) + 
-                   torch.mean(energy**2))
+        pde_residuals = self.compute_pde_residuals(x, t)
+        pde_loss = (torch.mean(pde_residuals['continuity']**2) +
+                   torch.mean(pde_residuals['momentum_x']**2) +
+                   torch.mean(pde_residuals['momentum_y']**2) +
+                   torch.mean(pde_residuals['energy']**2))
         
         # Boundary condition residuals
         bc_residuals = self.compute_bc_residuals(x, t)
-        bc_loss = sum(torch.mean(residual**2) for residual in bc_residuals)
+        bc_loss = sum(torch.mean(r**2) for r in bc_residuals.values())
         
-        return pde_loss + bc_loss
+        # Total loss
+        total_loss = pde_loss + 10.0 * bc_loss
+        
+        loss_dict = {
+            'total_loss': total_loss.item(),
+            'pde_loss': pde_loss.item(),
+            'bc_loss': bc_loss.item()
+        }
+        
+        return total_loss, loss_dict
 
-    def train_model(self, num_epochs: int, batch_size: int):
-        """Train the PINN"""
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.9)
+def train_model(model: FlowPINN, num_epochs: int = 10000):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    
+    # Generate training points
+    nx, ny, nt = 50, 20, 10
+    x = torch.linspace(0, model.L, nx, device=model.device)
+    y = torch.linspace(0, model.H, ny, device=model.device)
+    t = torch.linspace(0, 30, nt, device=model.device)
+    
+    X, Y, T = torch.meshgrid(x, y, t, indexing='ij')
+    x_train = torch.stack([X.flatten(), Y.flatten()], dim=1)
+    t_train = T.flatten().unsqueeze(1)
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        model.train()
+        optimizer.zero_grad()
         
-        # Generate training points
-        x = torch.linspace(0, self.L, 100)
-        y = torch.linspace(0, self.H, 20)
-        t = torch.linspace(0, 30, 30)
+        loss, loss_dict = model.compute_loss(x_train, t_train)
+        loss.backward()
+        optimizer.step()
         
-        X, Y, T = torch.meshgrid(x, y, t, indexing='ij')
-        training_points = torch.stack([X.flatten(), Y.flatten(), T.flatten()], dim=1)
-        
-        # Training loop
-        for epoch in range(num_epochs):
-            # Mini-batch training
-            indices = torch.randperm(training_points.shape[0])
-            total_loss = 0
-            num_batches = 0
-            
-            for i in range(0, training_points.shape[0], batch_size):
-                batch_indices = indices[i:i+batch_size]
-                batch_points = training_points[batch_indices].to(self.device)
-                
-                optimizer.zero_grad()
-                loss = self.loss_fn(batch_points[:, :2], batch_points[:, 2:3])
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-                num_batches += 1
-            
-            scheduler.step()
-            
-            if epoch % 100 == 0:
-                avg_loss = total_loss / num_batches
-                print(f"Epoch {epoch}, Average Loss: {avg_loss:.6f}")
+        if epoch % 100 == 0:
+            print(f"Epoch {epoch}: Total Loss = {loss_dict['total_loss']:.6f}, "
+                  f"PDE Loss = {loss_dict['pde_loss']:.6f}, "
+                  f"BC Loss = {loss_dict['bc_loss']:.6f}")
+    
+    return model
+
+# Example usage
+# if __name__ == "__main__":
+#     domain_params = {
+#         'L': 25 * 0.00116,  # Channel length (25 * Dh)
+#         'H': 0.5 * 0.00116  # Channel height (0.5 * Dh)
+#     }
+    
+#     # Initialize and train model
+#     model = FlowPINN(domain_params)
+#     trained_model = train_model(model)
+    
+#     # Initialize visualizer
+#     visualizer = FlowVisualizer(domain_params)
+    
+#     # Create plots at different times
+#     times = [0.0, 15.0, 30.0]
+#     for t in times:
+#         fig = visualizer.plot_flow_field(trained_model, t, f"Flow Field")
+#         plt.savefig(f"flow_field_t{t:.1f}.png")
+#         plt.close()
+    
+#     # Create animation
+#     t_range = np.linspace(0, 30, 31)
+#     anim = visualizer.create_animation(trained_model, t_range, "flow_animation.gif")
