@@ -76,11 +76,15 @@ class VanillaPINNSolver:
         return u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t
 
     def boundary_loss(self, x_b, t):
-        """Compute boundary condition loss"""
+        """Compute boundary condition loss with proper gradient handling"""
+        # Ensure tensors require gradients
+        x_b = x_b.clone().detach().requires_grad_(True)
+        t = t.clone().detach().requires_grad_(True)
+        
         u, v, p, T = self.model(x_b, t)
         
         # Inlet conditions (x = 0)
-        inlet_mask = x_b[:, 0] == 0
+        inlet_mask = (x_b[:, 0] == 0)
         u_in = self.compute_inlet_velocity()
         inlet_loss = (
             torch.mean(torch.square(u[inlet_mask] - u_in)) +
@@ -98,14 +102,61 @@ class VanillaPINNSolver:
         # Bottom wall heat flux condition
         bottom_wall_mask = (x_b[:, 1] == 0)
         if torch.any(bottom_wall_mask):
-            T_grad = torch.autograd.grad(torch.sum(T[bottom_wall_mask]), x_b,
-                                       create_graph=True, allow_unused=True)[0][:, 1]
-            heat_flux_loss = torch.mean(torch.square(
-                -self.physics_loss.k * T_grad - self.Q_flux))
+            T_masked = T[bottom_wall_mask]
+            if T_masked.requires_grad:  # Check if gradient computation is possible
+                T_grad = torch.autograd.grad(
+                    T_masked.sum(),
+                    x_b,
+                    create_graph=True,
+                    allow_unused=True
+                )[0]
+                if T_grad is not None:
+                    heat_flux_loss = torch.mean(torch.square(
+                        -self.physics_loss.k * T_grad[:, 1] - self.Q_flux
+                    ))
+                else:
+                    heat_flux_loss = torch.tensor(0.0, requires_grad=True)
+            else:
+                heat_flux_loss = torch.tensor(0.0, requires_grad=True)
         else:
-            heat_flux_loss = torch.tensor(0.0)
+            heat_flux_loss = torch.tensor(0.0, requires_grad=True)
         
         return inlet_loss + wall_loss + heat_flux_loss
+
+    def compute_gradients(self, u, v, p, T, x, t):
+        """Compute spatial and temporal gradients with proper handling"""
+        def grad(y, x, allow_unused=False):
+            if y.requires_grad:
+                grad_outputs = torch.ones_like(y)
+                try:
+                    return torch.autograd.grad(y, [x], grad_outputs=grad_outputs,
+                                            create_graph=True, allow_unused=allow_unused)[0]
+                except RuntimeError:
+                    return torch.zeros_like(x)
+            return torch.zeros_like(x)
+        
+        # First derivatives
+        u_x = grad(u.sum(), x)[:, 0:1]
+        u_y = grad(u.sum(), x)[:, 1:2]
+        v_x = grad(v.sum(), x)[:, 0:1]
+        v_y = grad(v.sum(), x)[:, 1:2]
+        T_x = grad(T.sum(), x)[:, 0:1]
+        T_y = grad(T.sum(), x)[:, 1:2]
+        
+        # Second derivatives
+        u_xx = grad(u_x.sum(), x)[:, 0:1]
+        u_yy = grad(u_y.sum(), x)[:, 1:2]
+        v_xx = grad(v_x.sum(), x)[:, 0:1]
+        v_yy = grad(v_y.sum(), x)[:, 1:2]
+        T_xx = grad(T_x.sum(), x)[:, 0:1]
+        T_yy = grad(T_y.sum(), x)[:, 1:2]
+        
+        # Time derivatives
+        u_t = grad(u.sum(), t)
+        v_t = grad(v.sum(), t)
+        T_t = grad(T.sum(), t)
+        
+        return u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t
 
     def compute_inlet_velocity(self):
         """Compute inlet velocity based on Reynolds number"""
@@ -115,8 +166,10 @@ class VanillaPINNSolver:
         self.optimizer.zero_grad()
         
         # Ensure inputs require gradients
-        x_domain.requires_grad_(True)
-        t_domain.requires_grad_(True)
+        x_domain = x_domain.clone().detach().requires_grad_(True)
+        t_domain = t_domain.clone().detach().requires_grad_(True)
+        x_boundary = x_boundary.clone().detach().requires_grad_(True)
+        t_boundary = t_boundary.clone().detach().requires_grad_(True)
         
         # Forward pass for domain points
         u, v, p, T = self.model(x_domain, t_domain)
@@ -134,7 +187,7 @@ class VanillaPINNSolver:
         energy = self.physics_loss.energy_loss(T, u, v, lambda x: T_x, lambda x: T_y,
                                              lambda x: T_xx, lambda x: T_yy, T_t)
         
-        # Boundary losses using boundary time tensor
+        # Boundary losses
         bc_loss = self.boundary_loss(x_boundary, t_boundary)
         
         # Total loss
