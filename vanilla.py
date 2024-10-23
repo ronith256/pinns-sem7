@@ -85,14 +85,14 @@ class VanillaPINNSolver:
             eps=1e-8
         )
         
-        # Learning rate scheduler with warm-up and decay
-        self.scheduler = torch.optim.OneCycleLR(
+        # Learning rate scheduler with reduce on plateau strategy
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            max_lr=1e-3,
-            steps_per_epoch=1,
-            epochs=10000,
-            pct_start=0.1,
-            div_factor=25.0
+            mode='min',
+            factor=0.5,
+            patience=500,
+            verbose=True,
+            min_lr=1e-6
         )
         
         # Loss weights for balancing different terms
@@ -107,6 +107,105 @@ class VanillaPINNSolver:
         # Initialize best model tracking
         self.best_loss = float('inf')
         self.best_model_state = None
+
+    def to(self, device: torch.device) -> 'VanillaPINNSolver':
+        """Move solver to specified device"""
+        self.device = device
+        self.model = self.model.to(device)
+        self.physics_loss = self.physics_loss.to(device)
+        return self
+
+    def compute_gradients(self, u: torch.Tensor, v: torch.Tensor,
+                         p: torch.Tensor, T: torch.Tensor,
+                         x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """Compute spatial and temporal gradients with proper device handling"""
+        x = x.to(self.device).requires_grad_(True)
+        t = t.to(self.device).requires_grad_(True)
+        
+        try:
+            def grad(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+                """Helper function for gradient computation"""
+                return compute_gradient(y, x, allow_unused=True)
+            
+            # First derivatives
+            u_x = grad(u.sum(), x)[:, 0:1]
+            u_y = grad(u.sum(), x)[:, 1:2]
+            v_x = grad(v.sum(), x)[:, 0:1]
+            v_y = grad(v.sum(), x)[:, 1:2]
+            T_x = grad(T.sum(), x)[:, 0:1]
+            T_y = grad(T.sum(), x)[:, 1:2]
+            
+            # Second derivatives
+            u_xx = grad(u_x.sum(), x)[:, 0:1]
+            u_yy = grad(u_y.sum(), x)[:, 1:2]
+            v_xx = grad(v_x.sum(), x)[:, 0:1]
+            v_yy = grad(v_y.sum(), x)[:, 1:2]
+            T_xx = grad(T_x.sum(), x)[:, 0:1]
+            T_yy = grad(T_y.sum(), x)[:, 1:2]
+            
+            # Time derivatives
+            u_t = grad(u.sum(), t)
+            v_t = grad(v.sum(), t)
+            T_t = grad(T.sum(), t)
+            
+            return u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t
+            
+        except Exception as e:
+            print(f"Error computing gradients: {str(e)}")
+            zeros = torch.zeros_like(x[:, 0:1])
+            return tuple([zeros] * 15)
+
+    def compute_inlet_velocity(self) -> torch.Tensor:
+        """Compute inlet velocity based on Reynolds number"""
+        return (self.Re * self.physics_loss.mu / 
+                (self.physics_loss.rho * self.H)).to(self.device)
+
+    def boundary_loss(self, x_b: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Compute boundary condition loss with device handling"""
+        x_b = x_b.to(self.device).requires_grad_(True)
+        t = t.to(self.device).requires_grad_(True)
+        
+        try:
+            u, v, p, T = self.model(x_b, t)
+            
+            # Inlet conditions (x = 0)
+            inlet_mask = (x_b[:, 0] == 0)
+            u_in = self.compute_inlet_velocity()
+            inlet_loss = (
+                torch.mean(torch.square(u[inlet_mask] - u_in)) +
+                torch.mean(torch.square(v[inlet_mask])) +
+                torch.mean(torch.square(T[inlet_mask] - 300))
+            )
+            
+            # Wall conditions (y = 0 or y = H)
+            wall_mask = (x_b[:, 1] == 0) | (x_b[:, 1] == self.H)
+            wall_loss = (
+                torch.mean(torch.square(u[wall_mask])) +
+                torch.mean(torch.square(v[wall_mask]))
+            )
+            
+            # Bottom wall heat flux condition
+            bottom_wall_mask = (x_b[:, 1] == 0)
+            if torch.any(bottom_wall_mask):
+                T_masked = T[bottom_wall_mask]
+                if T_masked.requires_grad:
+                    T_grad = compute_gradient(T_masked.sum(), x_b, allow_unused=True)
+                    if T_grad is not None:
+                        heat_flux_loss = torch.mean(torch.square(
+                            -self.physics_loss.k * T_grad[:, 1] - self.Q_flux
+                        ))
+                    else:
+                        heat_flux_loss = torch.tensor(0.0, device=self.device)
+                else:
+                    heat_flux_loss = torch.tensor(0.0, device=self.device)
+            else:
+                heat_flux_loss = torch.tensor(0.0, device=self.device)
+            
+            return inlet_loss + wall_loss + heat_flux_loss
+            
+        except Exception as e:
+            print(f"Error computing boundary loss: {str(e)}")
+            return torch.tensor(float('inf'), device=self.device)
         
     def train_step(self, x_domain: torch.Tensor, x_boundary: torch.Tensor,
                   t_domain: torch.Tensor, t_boundary: torch.Tensor) -> dict:
@@ -128,7 +227,7 @@ class VanillaPINNSolver:
             grads = self.compute_gradients(u, v, p, T, x_domain, t_domain)
             u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t = grads
             
-            # Compute individual losses with weights
+            # Compute individual losses with weights and gradient masking
             losses = {
                 'continuity': self.loss_weights['continuity'] * self.physics_loss.continuity_loss(
                     u, v, lambda x: u_x, lambda x: v_y),
@@ -147,27 +246,27 @@ class VanillaPINNSolver:
             # Compute total loss with loss scaling for stability
             total_loss = sum(losses.values())
             
+            # Check for invalid loss values
+            if not torch.isfinite(total_loss):
+                raise ValueError("Loss is not finite")
+            
             # Backward pass with gradient clipping
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
-            # Optimizer step and scheduler update
+            # Optimizer step
             self.optimizer.step()
-            self.scheduler.step()
-            
-            # Update best model if needed
-            if total_loss.item() < self.best_loss:
-                self.best_loss = total_loss.item()
-                self.best_model_state = {
-                    key: value.cpu() for key, value in self.model.state_dict().items()
-                }
             
             # Convert losses to float for logging
-            return {k: v.item() for k, v in losses.items()}
+            losses = {k: v.item() for k, v in losses.items()}
+            losses['total'] = total_loss.item()
+            
+            return losses
             
         except Exception as e:
             print(f"Error in training step: {str(e)}")
-            return {k: float('inf') for k in self.loss_weights.keys()}
+            return {k: float('inf') for k in ['continuity', 'momentum_x', 'momentum_y', 
+                                            'energy', 'boundary', 'total']}
     
     def train(self, epochs: int, nx: int = 501, ny: int = 51,
               batch_size: Optional[int] = 1024) -> List[dict]:
@@ -212,31 +311,39 @@ class VanillaPINNSolver:
                     k: sum(loss[k] for loss in batch_losses) / len(batch_losses)
                     for k in batch_losses[0].keys()
                 }
-                total_loss = sum(avg_loss.values())
+                total_loss = avg_loss['total']
                 history.append(avg_loss)
+                
+                # Update learning rate scheduler
+                self.scheduler.step(total_loss)
                 
                 # Early stopping check
                 if total_loss < best_loss - min_delta:
                     best_loss = total_loss
                     patience_counter = 0
+                    # Save best model state
+                    self.best_model_state = {
+                        key: value.cpu() for key, value in self.model.state_dict().items()
+                    }
                 else:
                     patience_counter += 1
                 
                 # Print progress
                 if epoch % 100 == 0:
-                    print(f"Epoch {epoch}")
+                    print(f"\nEpoch {epoch}")
                     print(f"Total Loss: {total_loss:.6f}")
                     for k, v in avg_loss.items():
-                        print(f"{k}: {v:.6f}")
+                        if k != 'total':
+                            print(f"{k}: {v:.6f}")
                     print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.2e}")
                 
                 # Check stopping conditions
                 if patience_counter >= patience:
-                    print("Early stopping triggered")
+                    print("\nEarly stopping triggered")
                     break
                 
-                if total_loss > 1e5:
-                    print("Training diverged")
+                if total_loss > 1e5 or not torch.isfinite(torch.tensor(total_loss)):
+                    print("\nTraining diverged")
                     break
             
             # Restore best model
@@ -250,3 +357,135 @@ class VanillaPINNSolver:
         except Exception as e:
             print(f"Error in training: {str(e)}")
             return []
+
+    def predict(self, x: torch.Tensor, t: torch.Tensor, 
+                batch_size: Optional[int] = None) -> Tuple[torch.Tensor, ...]:
+        """Make predictions with batching support and error handling"""
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                x = x.to(self.device)
+                t = t.to(self.device)
+                
+                if batch_size is None or batch_size >= x.shape[0]:
+                    # Single batch prediction
+                    return self.model(x, t)
+                else:
+                    # Batch predictions
+                    n_samples = x.shape[0]
+                    n_batches = (n_samples + batch_size - 1) // batch_size
+                    
+                    u_list, v_list, p_list, T_list = [], [], [], []
+                    
+                    for i in range(n_batches):
+                        start_idx = i * batch_size
+                        end_idx = min((i + 1) * batch_size, n_samples)
+                        
+                        u_batch, v_batch, p_batch, T_batch = self.model(
+                            x[start_idx:end_idx], 
+                            t[start_idx:end_idx]
+                        )
+                        
+                        u_list.append(u_batch)
+                        v_list.append(v_batch)
+                        p_list.append(p_batch)
+                        T_list.append(T_batch)
+                    
+                    return (torch.cat(u_list, dim=0), 
+                            torch.cat(v_list, dim=0),
+                            torch.cat(p_list, dim=0), 
+                            torch.cat(T_list, dim=0))
+                
+        except Exception as e:
+            print(f"Error in prediction: {str(e)}")
+            zeros = torch.zeros(x.shape[0], 1, device=self.device)
+            return zeros, zeros, zeros, zeros
+
+    def validate(self, x_val: torch.Tensor, t_val: torch.Tensor) -> dict:
+        """Validate model performance"""
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                x_val = x_val.to(self.device)
+                t_val = t_val.to(self.device)
+                
+                # Forward pass
+                u, v, p, T = self.model(x_val, t_val)
+                
+                # Compute gradients for validation
+                grads = self.compute_gradients(u, v, p, T, x_val, t_val)
+                u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t = grads
+                
+                # Compute individual losses
+                validation_losses = {
+                    'continuity': self.physics_loss.continuity_loss(
+                        u, v, lambda x: u_x, lambda x: v_y).item(),
+                    'momentum_x': self.physics_loss.momentum_x_loss(
+                        u, v, p, lambda x: u_x, lambda x: u_y,
+                        lambda x: u_xx, lambda x: u_yy, u_t).item(),
+                    'momentum_y': self.physics_loss.momentum_y_loss(
+                        u, v, p, lambda x: v_x, lambda x: v_y,
+                        lambda x: v_xx, lambda x: v_yy, v_t).item(),
+                    'energy': self.physics_loss.energy_loss(
+                        T, u, v, lambda x: T_x, lambda x: T_y,
+                        lambda x: T_xx, lambda x: T_yy, T_t).item(),
+                    'boundary': self.boundary_loss(x_val, t_val).item()
+                }
+                
+                validation_losses['total'] = sum(validation_losses.values())
+                return validation_losses
+                
+        except Exception as e:
+            print(f"Error in validation: {str(e)}")
+            return {k: float('inf') for k in ['continuity', 'momentum_x', 'momentum_y', 
+                                            'energy', 'boundary', 'total']}
+
+    def save_model(self, path: str):
+        """Save model state with error handling"""
+        try:
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'loss_weights': self.loss_weights,
+                'best_loss': self.best_loss,
+                'best_model_state': self.best_model_state,
+                'device': self.device,
+                'domain_params': {
+                    'L': self.L,
+                    'H': self.H,
+                    'Re': self.Re,
+                    'Q_flux': self.Q_flux
+                }
+            }, path)
+            print(f"Model saved successfully to {path}")
+        except Exception as e:
+            print(f"Error saving model: {str(e)}")
+
+    def load_model(self, path: str):
+        """Load model state with error handling"""
+        try:
+            checkpoint = torch.load(path, map_location=self.device)
+            
+            # Load model state
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            # Load other parameters
+            self.loss_weights = checkpoint['loss_weights']
+            self.best_loss = checkpoint['best_loss']
+            self.best_model_state = checkpoint['best_model_state']
+            
+            # Load domain parameters
+            params = checkpoint['domain_params']
+            self.L = params['L']
+            self.H = params['H']
+            self.Re = params['Re']
+            self.Q_flux = params['Q_flux']
+            
+            # Move model to correct device
+            self.to(self.device)
+            print(f"Model loaded successfully from {path}")
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
