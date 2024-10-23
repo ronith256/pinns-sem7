@@ -216,7 +216,7 @@ class VanillaPINNSolver:
                 loss = self.train_step(x_domain, x_boundary, t_domain, t_boundary)
                 losses.append(loss)
                 
-                if epoch % 100 == 0:
+                if epoch:
                     print(f"Epoch {epoch}, Loss: {loss:.6f}")
                     # Check for divergence
                     if loss > 1e5:
