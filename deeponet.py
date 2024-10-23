@@ -17,6 +17,9 @@ class FlowDeepONet:
         Args:
             domain_params: Dictionary containing domain parameters (L, H)
         """
+        # Device configuration
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         # Physical parameters
         self.rho = 997.07  # Density
         self.mu = 8.9e-4   # Dynamic viscosity
@@ -31,11 +34,6 @@ class FlowDeepONet:
         self.Re = 200
         self.Dh = 0.00116
         self.U_in = (self.Re * self.mu) / (self.rho * self.Dh)
-        
-        # Network parameters
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.n_branch = 40  # Number of branch neurons
-        self.n_trunk = 128  # Number of trunk neurons
         
         # Initialize the model
         self._setup_geometry()
@@ -52,6 +50,43 @@ class FlowDeepONet:
         
         # Spatio-temporal domain
         self.geomtime = dde.geometry.GeometryXTime(self.geom, self.timedomain)
+        
+    def _navier_stokes_pde(self, x, y):
+        """Define the Navier-Stokes PDEs."""
+        # Split variables
+        u = y[:, 0:1]
+        v = y[:, 1:2]
+        p = y[:, 2:3]
+        T = y[:, 3:4]
+        
+        # Derivatives
+        du_x = dde.grad.jacobian(y, x, i=0, j=0)
+        du_y = dde.grad.jacobian(y, x, i=0, j=1)
+        du_t = dde.grad.jacobian(y, x, i=0, j=2)
+        dv_x = dde.grad.jacobian(y, x, i=1, j=0)
+        dv_y = dde.grad.jacobian(y, x, i=1, j=1)
+        dv_t = dde.grad.jacobian(y, x, i=1, j=2)
+        dp_x = dde.grad.jacobian(y, x, i=2, j=0)
+        dp_y = dde.grad.jacobian(y, x, i=2, j=1)
+        dT_x = dde.grad.jacobian(y, x, i=3, j=0)
+        dT_y = dde.grad.jacobian(y, x, i=3, j=1)
+        dT_t = dde.grad.jacobian(y, x, i=3, j=2)
+        
+        # Second derivatives
+        du_xx = dde.grad.hessian(y, x, component=0, i=0, j=0)
+        du_yy = dde.grad.hessian(y, x, component=0, i=1, j=1)
+        dv_xx = dde.grad.hessian(y, x, component=1, i=0, j=0)
+        dv_yy = dde.grad.hessian(y, x, component=1, i=1, j=1)
+        dT_xx = dde.grad.hessian(y, x, component=3, i=0, j=0)
+        dT_yy = dde.grad.hessian(y, x, component=3, i=1, j=1)
+        
+        # Equations
+        continuity = du_x + dv_y
+        momentum_x = self.rho * (du_t + u * du_x + v * du_y) + dp_x - self.mu * (du_xx + du_yy)
+        momentum_y = self.rho * (dv_t + u * dv_x + v * dv_y) + dp_y - self.mu * (dv_xx + dv_yy)
+        energy = self.rho * self.cp * (dT_t + u * dT_x + v * dT_y) - self.k * (dT_xx + dT_yy)
+        
+        return [continuity, momentum_x, momentum_y, energy]
     
     def _generate_data(self, nx: int, ny: int, nt: int):
         """Generate training and testing data."""
@@ -63,148 +98,81 @@ class FlowDeepONet:
         X, Y, T = np.meshgrid(x, y, t, indexing='ij')
         points = np.stack([X.flatten(), Y.flatten(), T.flatten()], axis=1)
         
-        # Synthetic solution function
-        def analytical_solution(points):
-            x, y, t = points[:, 0], points[:, 1], points[:, 2]
-            
-            # Velocity components
-            u = self.U_in * (1 - np.exp(-0.1 * t)) * (1 - (y/self.H)**2)
-            v = np.zeros_like(u)
-            
-            # Pressure
-            p = self.rho * self.U_in**2 * (1 - x/self.L)
-            
-            # Temperature
-            T = 300 + 20 * (y/self.H) * (1 - np.exp(-0.05 * t))
-            
-            return np.stack([u, v, p, T], axis=1)
+        # Initial analytical solution
+        u = self.U_in * (1 - (points[:, 1]/self.H)**2)
+        v = np.zeros_like(u)
+        p = self.rho * self.U_in**2 * (1 - points[:, 0]/self.L)
+        T = 300 + 20 * (points[:, 1]/self.H)
         
-        # Generate solutions
-        values = analytical_solution(points)
-        
-        return points, values
+        return points, np.stack([u, v, p, T], axis=1)
         
     def _setup_training_data(self):
-        """Set up training data for DeepONet."""
-        # Generate training data
+        """Set up training data."""
         train_points, train_values = self._generate_data(20, 10, 5)
-        
-        # Generate testing data (coarser grid)
         test_points, test_values = self._generate_data(10, 5, 3)
         
-        # Create input features for branch net (sensor measurements)
-        n_sensors = 10
-        sensor_points, sensor_values = self._generate_data(n_sensors, n_sensors, 1)
-        self.sensor_data = sensor_values.flatten()
-        
-        # Store data
-        self.train_x = (self.sensor_data, train_points)
-        self.train_y = train_values
-        self.test_x = (self.sensor_data, test_points)
-        self.test_y = test_values
-        
-    def _create_model(self):
-        """Create the DeepONet model."""
-        # Set up networks
-        branch_net = dde.nn.FNN(
-            layer_sizes=[self.sensor_data.size, 128, 128, self.n_branch],
-            activation="tanh",
-            kernel_initializer="Glorot uniform"
+        # Create observation points for BC
+        self.observe_x = dde.icbc.PointSetBC(
+            points=train_points,
+            values=train_values[:, 0:1],
+            component=0
+        )
+        self.observe_y = dde.icbc.PointSetBC(
+            points=train_points,
+            values=train_values[:, 1:2],
+            component=1
         )
         
-        trunk_net = dde.nn.FNN(
-            layer_sizes=[3, self.n_trunk, self.n_trunk, self.n_trunk, 4],
-            activation="tanh",
-            kernel_initializer="Glorot uniform"
+    def _create_model(self):
+        """Create the PINN model."""
+        # Network architecture
+        layer_size = [3] + [50] * 6 + [4]
+        activation = "tanh"
+        initializer = "Glorot uniform"
+        
+        # Create neural network
+        self.net = dde.nn.FNN(
+            layer_size=layer_size,
+            activation=activation,
+            kernel_initializer=initializer
         )
         
         # Create data
-        data = dde.data.Triple(
-            X_train=self.train_x,
-            y_train=self.train_y,
-            X_test=self.test_x,
-            y_test=self.test_y
+        data = dde.data.TimePDE(
+            geometry=self.geomtime,
+            pde=self._navier_stokes_pde,
+            bcs=[self.observe_x, self.observe_y],
+            num_domain=1000,
+            num_boundary=200,
+            num_initial=100
         )
         
         # Create model
-        self.net = dde.nn.DeepONet(
-            branch_net=branch_net,
-            trunk_net=trunk_net,
-            output_dim=4
-        )
+        self.model = dde.Model(data, self.net)
         
-        # Define loss weights
-        weights = {
-            "data": 1.0,
-            "continuity": 0.1,
-            "momentum_x": 0.1,
-            "momentum_y": 0.1,
-            "energy": 0.1
-        }
-        
-        # Custom loss function including physics constraints
-        def custom_loss(model, batch_data):
-            x_branch, x_trunk = batch_data[0]
-            y_true = batch_data[1]
-            
-            # Data loss
-            y_pred = model(x_branch, x_trunk)
-            loss_data = torch.mean((y_pred - y_true) ** 2)
-            
-            # Physics loss (simplified)
-            u = y_pred[:, 0:1]
-            v = y_pred[:, 1:2]
-            
-            # Compute derivatives
-            du_dx = dde.grad.jacobian(u, x_trunk[:, 0:1])
-            dv_dy = dde.grad.jacobian(v, x_trunk[:, 1:2])
-            
-            # Continuity equation
-            loss_continuity = torch.mean((du_dx + dv_dy) ** 2)
-            
-            # Total loss
-            total_loss = (
-                weights["data"] * loss_data +
-                weights["continuity"] * loss_continuity
-            )
-            
-            return total_loss
-        
-        # Compile model
-        self.net.compile("adam", lr=1e-3, loss=custom_loss)
-    
     def train(self, epochs: int = 10000) -> Dict:
-        """
-        Train the model.
-        
-        Args:
-            epochs: Number of training epochs
-            
-        Returns:
-            Dictionary containing training history
-        """
+        """Train the model."""
         logger.info(f"Starting training for {epochs} epochs")
         
-        losshistory, train_state = self.net.train(
-            epochs=epochs
+        # First stage training with Adam
+        self.model.compile("adam", lr=1e-3)
+        loss_history, train_state = self.model.train(
+            iterations=epochs//2,
+            display_every=1000
         )
         
-        return losshistory
+        # Second stage training with L-BFGS
+        self.model.compile("L-BFGS")
+        loss_history, train_state = self.model.train(
+            iterations=epochs//2,
+            display_every=1000
+        )
+        
+        return loss_history
     
     def predict(self, x_star: np.ndarray) -> Tuple[np.ndarray, ...]:
-        """
-        Make predictions at given points.
-        
-        Args:
-            x_star: Points to evaluate at, shape (n_points, 3)
-            
-        Returns:
-            Tuple of (u, v, p, T) predictions
-        """
-        # Prepare input data
-        x_branch = np.tile(self.sensor_data, (x_star.shape[0], 1))
-        predictions = self.net.predict((x_branch, x_star))
-        
+        """Make predictions at given points."""
+        predictions = self.model.predict(x_star)
         return (
             predictions[:, 0:1],  # u
             predictions[:, 1:2],  # v
@@ -213,13 +181,7 @@ class FlowDeepONet:
         )
     
     def plot_results(self, t: float, save_path: str = None) -> None:
-        """
-        Plot the flow field results at a specific time.
-        
-        Args:
-            t: Time to plot at
-            save_path: Optional path to save the figure
-        """
+        """Plot the flow field results at a specific time."""
         logger.info(f"Plotting results at t = {t}")
         
         # Create grid
@@ -239,10 +201,10 @@ class FlowDeepONet:
         u, v, p, T = self.predict(x_star)
         
         # Reshape predictions
-        u = u.reshape((ny, nx))
-        v = v.reshape((ny, nx))
-        p = p.reshape((ny, nx))
-        T = T.reshape((ny, nx))
+        u = u.reshape((nx, ny))
+        v = v.reshape((nx, ny))
+        p = p.reshape((nx, ny))
+        T = T.reshape((nx, ny))
         
         # Create figure
         fig = plt.figure(figsize=(15, 10))
@@ -250,16 +212,16 @@ class FlowDeepONet:
         # Velocity magnitude plot
         plt.subplot(2, 2, 1)
         vel_mag = np.sqrt(u**2 + v**2)
-        plt.contourf(X, Y, vel_mag.T, levels=50, cmap='RdYlBu_r')
+        plt.contourf(X, Y, vel_mag, levels=50, cmap='RdYlBu_r')
         plt.colorbar(label='Velocity Magnitude (m/s)')
-        plt.streamplot(x, y, u.T, v.T, color='k', density=1.5)
+        plt.streamplot(x, y, u, v, color='k', density=1.5)
         plt.title('Velocity Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
         
         # Pressure plot
         plt.subplot(2, 2, 2)
-        plt.contourf(X, Y, p.T, levels=50, cmap='RdYlBu_r')
+        plt.contourf(X, Y, p, levels=50, cmap='RdYlBu_r')
         plt.colorbar(label='Pressure (Pa)')
         plt.title('Pressure Field')
         plt.xlabel('x (m)')
@@ -267,7 +229,7 @@ class FlowDeepONet:
         
         # Temperature plot
         plt.subplot(2, 2, 3)
-        plt.contourf(X, Y, T.T, levels=50, cmap='hot')
+        plt.contourf(X, Y, T, levels=50, cmap='hot')
         plt.colorbar(label='Temperature (K)')
         plt.title('Temperature Field')
         plt.xlabel('x (m)')
@@ -277,10 +239,10 @@ class FlowDeepONet:
         plt.subplot(2, 2, 4)
         dx = x[1] - x[0]
         dy = y[1] - y[0]
-        dudy = np.gradient(u, dy, axis=0)
-        dvdx = np.gradient(v, dx, axis=1)
+        dudy = np.gradient(u, dy, axis=1)
+        dvdx = np.gradient(v, dx, axis=0)
         vorticity = dvdx - dudy
-        plt.contourf(X, Y, vorticity.T, levels=50, cmap='RdBu')
+        plt.contourf(X, Y, vorticity, levels=50, cmap='RdBu')
         plt.colorbar(label='Vorticity (1/s)')
         plt.title('Vorticity Field')
         plt.xlabel('x (m)')
