@@ -25,16 +25,31 @@ class FlowVisualizer:
         
     def _create_mesh(self, nx: int = 100, ny: int = 50) -> tuple:
         """Create a mesh for visualization."""
-        print("Creating mesh with nx =", nx, "ny =", ny)
         x = torch.linspace(0, self.L, nx, device=self.device)
         y = torch.linspace(0, self.H, ny, device=self.device)
         X, Y = torch.meshgrid(x, y, indexing='ij')
-        print("X shape:", X.shape)
-        print("Y shape:", Y.shape)
-        
         xy = torch.stack([X.flatten(), Y.flatten()], dim=1)
-        print("xy shape:", xy.shape)
         return X, Y, xy
+    
+    def _compute_vorticity(self, u: np.ndarray, v: np.ndarray, 
+                          dx: float, dy: float) -> np.ndarray:
+        """
+        Compute vorticity using central differences with handling for edge cases.
+        """
+        dudy = np.zeros_like(u)
+        dvdx = np.zeros_like(v)
+        
+        # Interior points - central difference
+        dudy[1:-1, :] = (u[2:, :] - u[:-2, :]) / (2 * dy)
+        dvdx[:, 1:-1] = (v[:, 2:] - v[:, :-2]) / (2 * dx)
+        
+        # Edge points - forward/backward difference
+        dudy[0, :] = (u[1, :] - u[0, :]) / dy
+        dudy[-1, :] = (u[-1, :] - u[-2, :]) / dy
+        dvdx[:, 0] = (v[:, 1] - v[:, 0]) / dx
+        dvdx[:, -1] = (v[:, -1] - v[:, -2]) / dx
+        
+        return dvdx - dudy
     
     def plot_flow_field(self, model: FlowPINN, t: float, 
                        title: str = "Flow Field", 
@@ -58,14 +73,11 @@ class FlowVisualizer:
         X, Y, xy = self._create_mesh(nx, ny)
         t_tensor = torch.full((xy.shape[0], 1), t, device=self.device)
         
-        print("t_tensor shape:", t_tensor.shape)
-        
         # Get predictions
         with torch.no_grad():
             u, v, p, T = model.predict(xy, t_tensor)
-            print("Predictions shapes - u:", u.shape, "v:", v.shape, "p:", p.shape, "T:", T.shape)
-            
-        # Reshape predictions
+        
+        # Reshape predictions and convert to numpy
         u = u.reshape(nx, ny).cpu().numpy()
         v = v.reshape(nx, ny).cpu().numpy()
         p = p.reshape(nx, ny).cpu().numpy()
@@ -73,18 +85,9 @@ class FlowVisualizer:
         X = X.cpu().numpy()
         Y = Y.cpu().numpy()
         
-        print("After reshape - u:", u.shape, "v:", v.shape, "p:", p.shape, "T:", T.shape)
-        print("X shape after numpy:", X.shape)
-        print("Y shape after numpy:", Y.shape)
-        
-        # Create meshgrid for streamplot
-        x_1d = np.linspace(0, self.L, nx)
-        y_1d = np.linspace(0, self.H, ny)
-        X_stream, Y_stream = np.meshgrid(x_1d, y_1d)
-        
-        print("Streamplot grid shapes - X_stream:", X_stream.shape, "Y_stream:", Y_stream.shape)
-        print("Sample X_stream values:", X_stream[0, :5])
-        print("Sample Y_stream values:", Y_stream[:5, 0])
+        # Calculate grid spacing
+        dx = X[1, 0] - X[0, 0]
+        dy = Y[0, 1] - Y[0, 0]
         
         # Create figure with subplots
         fig = plt.figure(figsize=self.figsize)
@@ -92,42 +95,43 @@ class FlowVisualizer:
         # Velocity magnitude plot
         plt.subplot(2, 2, 1)
         vel_mag = np.sqrt(u**2 + v**2)
-        plt.contourf(X, Y, vel_mag, levels=50, cmap=self.cmap)
-        plt.colorbar(label='Velocity Magnitude (m/s)')
+        vel_plot = plt.contourf(X, Y, vel_mag, levels=50, cmap=self.cmap)
+        plt.colorbar(vel_plot, label='Velocity Magnitude (m/s)')
         
-        # Need to transpose arrays for streamplot since it expects (y, x) ordering
-        u_stream = u.T
-        v_stream = v.T
-        print("Streamplot input shapes - u_stream:", u_stream.shape, "v_stream:", v_stream.shape)
-        
-        plt.streamplot(X_stream, Y_stream, u_stream, v_stream, color='k', density=1.5, linewidth=0.5)
+        # Add streamlines with proper handling
+        skip = 2  # Reduce density of streamlines
+        plt.streamplot(X[::skip, ::skip], Y[::skip, ::skip],
+                      u[::skip, ::skip], v[::skip, ::skip],
+                      color='k', density=1.5, linewidth=0.5,
+                      arrowsize=0.5)
         plt.title('Velocity Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
         
         # Pressure plot
         plt.subplot(2, 2, 2)
-        plt.contourf(X, Y, p, levels=50, cmap=self.cmap)
-        plt.colorbar(label='Pressure (Pa)')
+        p_plot = plt.contourf(X, Y, p, levels=50, cmap=self.cmap)
+        plt.colorbar(p_plot, label='Pressure (Pa)')
         plt.title('Pressure Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
         
         # Temperature plot
         plt.subplot(2, 2, 3)
-        plt.contourf(X, Y, T, levels=50, cmap='hot')
-        plt.colorbar(label='Temperature (K)')
+        T_plot = plt.contourf(X, Y, T, levels=50, cmap='hot')
+        plt.colorbar(T_plot, label='Temperature (K)')
         plt.title('Temperature Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
         
-        # Vorticity plot
+        # Vorticity plot with improved calculation
         plt.subplot(2, 2, 4)
-        dudy, dudx = np.gradient(u, Y[:, 0], X[0, :])
-        dvdy, dvdx = np.gradient(v, Y[:, 0], X[0, :])
-        vorticity = dvdx - dudy
-        plt.contourf(X, Y, vorticity, levels=50, cmap='RdBu')
-        plt.colorbar(label='Vorticity (1/s)')
+        vorticity = self._compute_vorticity(u, v, dx, dy)
+        # Use symmetric limits for vorticity plot
+        vmax = np.max(np.abs(vorticity))
+        v_plot = plt.contourf(X, Y, vorticity, levels=50,
+                             cmap='RdBu', vmin=-vmax, vmax=vmax)
+        plt.colorbar(v_plot, label='Vorticity (1/s)')
         plt.title('Vorticity Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
@@ -157,11 +161,8 @@ class FlowVisualizer:
         X, Y, xy = self._create_mesh(nx, ny)
         X = X.cpu().numpy()
         Y = Y.cpu().numpy()
-        
-        # Create meshgrid for streamplot
-        x_1d = np.linspace(0, self.L, nx)
-        y_1d = np.linspace(0, self.H, ny)
-        X_stream, Y_stream = np.meshgrid(x_1d, y_1d)
+        dx = X[1, 0] - X[0, 0]
+        dy = Y[0, 1] - Y[0, 0]
         
         def update(frame):
             plt.clf()
@@ -177,11 +178,18 @@ class FlowVisualizer:
             
             plt.contourf(X, Y, vel_mag, levels=50, cmap=self.cmap)
             plt.colorbar(label='Velocity Magnitude (m/s)')
-            plt.streamplot(X_stream, Y_stream, u.T, v.T, color='k', density=1.5, linewidth=0.5)
+            
+            # Add streamlines with reduced density
+            skip = 2
+            plt.streamplot(X[::skip, ::skip], Y[::skip, ::skip],
+                         u[::skip, ::skip], v[::skip, ::skip],
+                         color='k', density=1.5, linewidth=0.5,
+                         arrowsize=0.5)
+            
             plt.title(f'Flow Field at t = {t:.2f} s')
             plt.xlabel('x (m)')
             plt.ylabel('y (m)')
-            
+        
         anim = FuncAnimation(fig, update, frames=len(t_range), 
                            interval=100, blit=False)
         anim.save(save_path, writer='pillow', fps=10)
