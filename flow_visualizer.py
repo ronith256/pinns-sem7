@@ -73,13 +73,16 @@ class FlowVisualizer:
         def update(frame):
             t = t_range[frame]
             x_flat, t_tensor = self.create_input_tensor(t)
+            # Move tensors to model's device
+            x_flat = x_flat.to(model.device)
+            t_tensor = t_tensor.to(model.device)
             u, v, p, T = model.predict(x_flat, t_tensor)
             
-            # Reshape predictions
-            u = u.numpy().reshape(self.ny, self.nx)
-            v = v.numpy().reshape(self.ny, self.nx)
-            p = p.numpy().reshape(self.ny, self.nx)
-            T = T.numpy().reshape(self.ny, self.nx)
+            # Move results back to CPU for plotting
+            u = u.cpu().numpy().reshape(self.ny, self.nx)
+            v = v.cpu().numpy().reshape(self.ny, self.nx)
+            p = p.cpu().numpy().reshape(self.ny, self.nx)
+            T = T.cpu().numpy().reshape(self.ny, self.nx)
             
             # Clear previous plots
             for ax in (ax1, ax2, ax3, ax4):
@@ -121,11 +124,13 @@ class FlowVisualizer:
         
         for i, (name, model) in enumerate(models.items()):
             x_flat, t_tensor = self.create_input_tensor(t)
+            x_flat = x_flat.to(model.device)  # Move to model's device
+            t_tensor = t_tensor.to(model.device)
             u, v, p, T = model.predict(x_flat, t_tensor)
             
-            # Reshape predictions
-            u = u.numpy().reshape(self.ny, self.nx)
-            v = v.numpy().reshape(self.ny, self.nx)
+            # Move results back to CPU for plotting
+            u = u.cpu().numpy().reshape(self.ny, self.nx)
+            v = v.cpu().numpy().reshape(self.ny, self.nx)
             vel_mag = np.sqrt(u**2 + v**2)
             
             ax1 = fig.add_subplot(n_models, 2, 2*i + 1)

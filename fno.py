@@ -122,14 +122,15 @@ class FNO2d(nn.Module):
             x = x.to(device)
             t = t.to(device)
             
-            # Reshape and combine inputs
+            # Reshape input to match convolution expectations
             batch_size = x.shape[0]
-            x = x.reshape(batch_size, -1, self.H, self.W)
-            t = t.reshape(batch_size, 1, 1, 1).expand(-1, -1, self.H, self.W)
-            x = torch.cat([x, t], dim=1)
+            x_reshaped = x.reshape(batch_size, 2, self.H, self.W)  # 2 channels for x,y coordinates
+            t = t.reshape(batch_size, 1, 1, 1).expand(-1, 1, self.H, self.W)
+            inputs = torch.cat([x_reshaped, t], dim=1)  # 3 channels total
             
+            # Process through network
             # Initial projection
-            x = self.fc0(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            x = self.fc0(inputs.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
             x = self.padding(x)
             
             # Fourier layer 0: spectral conv -> regular conv -> nonlinearity

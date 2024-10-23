@@ -62,31 +62,28 @@ class DeepONetPINN(nn.Module):
         self.hidden_dim = hidden_dim
         
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        # Ensure inputs are on the same device as the model
-        device = next(self.parameters()).device
-        x = x.to(device)
-        t = t.to(device)
-        
-        # Combine spatial coordinates and time
-        inputs = torch.cat([x, t.reshape(-1, 1)], dim=1)
-        
         try:
-            # Get branch and trunk outputs
+            # Ensure inputs are on the same device as the model
+            device = next(self.parameters()).device
+            x = x.to(device)
+            t = t.to(device)
+            
+            # Combine spatial coordinates and time
+            inputs = torch.cat([x, t.reshape(-1, 1)], dim=1)
+            batch_size = inputs.shape[0]
+            
+            # Get branch and trunk outputs with proper reshaping
             branch_out = self.branch_net(inputs)
             trunk_out = self.trunk_net(inputs)
             
-            # Check for numerical issues
-            if check_nan_inf(branch_out, "branch_output") or check_nan_inf(trunk_out, "trunk_output"):
-                raise ValueError("NaN or Inf values detected in network outputs")
-            
             # Reshape branch output for dot product
-            branch_out = branch_out.reshape(-1, self.output_dim, self.hidden_dim)
-            trunk_out = trunk_out.reshape(-1, self.hidden_dim, 1)
+            branch_out = branch_out.reshape(batch_size, self.output_dim, self.hidden_dim)
+            trunk_out = trunk_out.reshape(batch_size, self.hidden_dim, 1)
             
             # Compute dot product
             outputs = torch.bmm(branch_out, trunk_out).squeeze(-1)
             
-            # Split outputs into velocity components, pressure, and temperature
+            # Split outputs
             u = outputs[:, 0:1]
             v = outputs[:, 1:2]
             p = outputs[:, 2:3]
@@ -96,7 +93,6 @@ class DeepONetPINN(nn.Module):
             
         except Exception as e:
             print(f"Error in DeepONet forward pass: {str(e)}")
-            # Return zero tensors in case of error
             zeros = torch.zeros(x.shape[0], 1, device=device)
             return zeros, zeros, zeros, zeros
 

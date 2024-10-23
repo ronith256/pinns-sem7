@@ -93,14 +93,14 @@ def compare_and_analyze_models():
 
     # Initialize visualizer
     visualizer = FlowVisualizer(domain_params)
-
+    
     # Compare models at different time steps
     time_points = [0.0, 1.0, 5.0, 10.0, 20.0, 30.0]
     
     for t in time_points:
         print(f"\nComparing models at t = {t}s")
         try:
-            fig = visualizer.compare_models(solvers, t, device)
+            fig = visualizer.compare_models(solvers, t)
             plt.savefig(f'results/comparison_t{t}.png')
             plt.close()
         except Exception as e:
