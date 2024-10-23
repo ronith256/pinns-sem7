@@ -6,7 +6,6 @@ from utils import *
 class VanillaPINN(nn.Module):
     def __init__(self, layers: list[int] = [3, 64, 64, 64, 4]):
         super().__init__()
-        self.name = "Vanilla PINN"
         self.layers = layers
         
         # Build the neural network
@@ -141,7 +140,8 @@ class VanillaPINNSolver:
             history.append(loss)
             if epoch % 100 == 0:
                 print(f"Epoch {epoch}, Loss: {loss:.6f}")
-                
+        return history
+         
     def predict(self, x, t):
         self.model.eval()
         with torch.no_grad():

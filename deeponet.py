@@ -174,12 +174,13 @@ class DeepONetPINNSolver:
         x_domain = create_domain_points(nx, ny, self.L, self.H)
         x_boundary = create_boundary_points(nx, ny, self.L, self.H)
         t = torch.zeros(x_domain.shape[0], 1)
-        
+        history = []
         for epoch in range(epochs):
             loss = self.train_step(x_domain, x_boundary, t)
+            history.append(loss)
             if epoch % 100 == 0:
                 print(f"Epoch {epoch}, Loss: {loss:.6f}")
-                
+        return history         
     def predict(self, x, t):
         self.model.eval()
         with torch.no_grad():

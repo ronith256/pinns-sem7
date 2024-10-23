@@ -60,7 +60,8 @@ def compare_and_analyze_models():
     #             print(f"Epoch {epoch}, Loss: {loss:.6f}")
     #     training_histories[name] = history
     for name, solver in solver.items():
-        solver.train(epochs)
+        history = solver.train(epochs)
+        training_histories[name] = history
 
     # Initialize visualizer
     visualizer = FlowVisualizer(domain_params)
