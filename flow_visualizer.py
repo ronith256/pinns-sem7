@@ -16,23 +16,24 @@ class FlowVisualizer:
         self.y = np.linspace(0, self.H, self.ny)
         self.X, self.Y = np.meshgrid(self.x, self.y)
         
-    def create_input_tensor(self, t: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    def create_input_tensor(self, t: float, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """Create input tensor for the models"""
         x_flat = torch.tensor(np.stack([self.X.flatten(), self.Y.flatten()], axis=1),
-                            dtype=torch.float32)
-        t_tensor = torch.ones(x_flat.shape[0], 1) * t
+                            dtype=torch.float32, device=device)
+        t_tensor = torch.ones(x_flat.shape[0], 1, dtype=torch.float32, device=device) * t
         return x_flat, t_tensor
     
     def plot_flow_field(self, model: torch.nn.Module, t: float, title: str):
         """Plot flow field at a given time"""
-        x_flat, t_tensor = self.create_input_tensor(t)
+        device = next(model.parameters()).device
+        x_flat, t_tensor = self.create_input_tensor(t, device)
         u, v, p, T = model.predict(x_flat, t_tensor)
         
-        # Reshape predictions
-        u = u.numpy().reshape(self.ny, self.nx)
-        v = v.numpy().reshape(self.ny, self.nx)
-        p = p.numpy().reshape(self.ny, self.nx)
-        T = T.numpy().reshape(self.ny, self.nx)
+        # Move predictions to CPU for plotting
+        u = u.cpu().numpy().reshape(self.ny, self.nx)
+        v = v.cpu().numpy().reshape(self.ny, self.nx)
+        p = p.cpu().numpy().reshape(self.ny, self.nx)
+        T = T.cpu().numpy().reshape(self.ny, self.nx)
         
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
         fig.suptitle(f'{title} at t = {t:.2f}s')
@@ -69,16 +70,14 @@ class FlowVisualizer:
                         save_path: str = None):
         """Create animation of the flow field evolution"""
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        device = next(model.parameters()).device
         
         def update(frame):
             t = t_range[frame]
-            x_flat, t_tensor = self.create_input_tensor(t)
-            # Move tensors to model's device
-            x_flat = x_flat.to(model.device)
-            t_tensor = t_tensor.to(model.device)
+            x_flat, t_tensor = self.create_input_tensor(t, device)
             u, v, p, T = model.predict(x_flat, t_tensor)
             
-            # Move results back to CPU for plotting
+            # Move results to CPU for plotting
             u = u.cpu().numpy().reshape(self.ny, self.nx)
             v = v.cpu().numpy().reshape(self.ny, self.nx)
             p = p.cpu().numpy().reshape(self.ny, self.nx)
@@ -123,12 +122,11 @@ class FlowVisualizer:
         fig = plt.figure(figsize=(15, 4*n_models))
         
         for i, (name, model) in enumerate(models.items()):
-            x_flat, t_tensor = self.create_input_tensor(t)
-            x_flat = x_flat.to(model.device)  # Move to model's device
-            t_tensor = t_tensor.to(model.device)
+            device = next(model.parameters()).device
+            x_flat, t_tensor = self.create_input_tensor(t, device)
             u, v, p, T = model.predict(x_flat, t_tensor)
             
-            # Move results back to CPU for plotting
+            # Move results to CPU for plotting
             u = u.cpu().numpy().reshape(self.ny, self.nx)
             v = v.cpu().numpy().reshape(self.ny, self.nx)
             vel_mag = np.sqrt(u**2 + v**2)
