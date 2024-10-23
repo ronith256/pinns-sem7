@@ -131,15 +131,22 @@ class FlowDeepONet:
     def _create_model(self):
         """Create the PINN model."""
         # Network architecture
-        layers = [3] + [50] * 6 + [4]
-        activation = "tanh"
+        # Define shared layers and output-specific layers
+        layer_sizes = [
+            3,              # Input layer (shared)
+            50,             # Hidden layer 1 (shared)
+            50,             # Hidden layer 2 (shared)
+            50,             # Hidden layer 3 (shared)
+            [20, 20, 20, 20],  # Hidden layer 4 (output-specific)
+            [10, 10, 10, 10],  # Hidden layer 5 (output-specific)
+            [1, 1, 1, 1]    # Output layer (one node per output)
+        ]
         
         # Create neural network with updated initialization
         self.net = dde.nn.FNN(
-            input_size=layers[0],
-            output_size=layers[-1],
-            hidden_layers=layers[1:-1],
-            activation=activation
+            layer_sizes=layer_sizes,
+            activation="tanh",
+            kernel_initializer="Glorot uniform"
         )
         
         # Move network to GPU if available
