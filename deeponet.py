@@ -19,6 +19,7 @@ class FlowDeepONet:
         """
         # Device configuration
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {self.device}")
         
         # Physical parameters
         self.rho = 997.07  # Density
@@ -104,7 +105,11 @@ class FlowDeepONet:
         p = self.rho * self.U_in**2 * (1 - points[:, 0]/self.L)
         T = 300 + 20 * (points[:, 1]/self.H)
         
-        return points, np.stack([u, v, p, T], axis=1)
+        # Convert to torch tensors and move to GPU if available
+        points = torch.tensor(points, dtype=torch.float32, device=self.device)
+        values = torch.tensor(np.stack([u, v, p, T], axis=1), dtype=torch.float32, device=self.device)
+        
+        return points, values
         
     def _setup_training_data(self):
         """Set up training data."""
@@ -113,29 +118,33 @@ class FlowDeepONet:
         
         # Create observation points for BC
         self.observe_x = dde.icbc.PointSetBC(
-            points=train_points,
-            values=train_values[:, 0:1],
+            points=train_points.cpu().numpy(),
+            values=train_values[:, 0:1].cpu().numpy(),
             component=0
         )
         self.observe_y = dde.icbc.PointSetBC(
-            points=train_points,
-            values=train_values[:, 1:2],
+            points=train_points.cpu().numpy(),
+            values=train_values[:, 1:2].cpu().numpy(),
             component=1
         )
         
     def _create_model(self):
         """Create the PINN model."""
         # Network architecture
-        layer_size = [3] + [50] * 6 + [4]
+        layers = [3] + [50] * 6 + [4]
         activation = "tanh"
-        initializer = "Glorot uniform"
         
-        # Create neural network
+        # Create neural network with updated initialization
         self.net = dde.nn.FNN(
-            layer_size=layer_size,
-            activation=activation,
-            kernel_initializer=initializer
+            input_size=layers[0],
+            output_size=layers[-1],
+            hidden_layers=layers[1:-1],
+            activation=activation
         )
+        
+        # Move network to GPU if available
+        if torch.cuda.is_available():
+            self.net.cuda()
         
         # Create data
         data = dde.data.TimePDE(
@@ -155,29 +164,36 @@ class FlowDeepONet:
         logger.info(f"Starting training for {epochs} epochs")
         
         # First stage training with Adam
-        self.model.compile("adam", lr=1e-3)
+        self.model.compile("adam", lr=1e-3, metrics=["l2 relative error"])
         loss_history, train_state = self.model.train(
             iterations=epochs//2,
-            display_every=1000
+            display_every=100
         )
         
         # Second stage training with L-BFGS
-        self.model.compile("L-BFGS")
+        self.model.compile("L-BFGS", metrics=["l2 relative error"])
         loss_history, train_state = self.model.train(
             iterations=epochs//2,
-            display_every=1000
+            display_every=100
         )
         
         return loss_history
     
     def predict(self, x_star: np.ndarray) -> Tuple[np.ndarray, ...]:
         """Make predictions at given points."""
-        predictions = self.model.predict(x_star)
+        # Convert input to tensor and move to GPU if available
+        x_star_tensor = torch.tensor(x_star, dtype=torch.float32, device=self.device)
+        
+        # Make prediction
+        with torch.no_grad():
+            predictions = self.model.predict(x_star_tensor.cpu().numpy())
+            predictions = torch.tensor(predictions, device=self.device)
+        
         return (
-            predictions[:, 0:1],  # u
-            predictions[:, 1:2],  # v
-            predictions[:, 2:3],  # p
-            predictions[:, 3:4]   # T
+            predictions[:, 0:1].cpu().numpy(),  # u
+            predictions[:, 1:2].cpu().numpy(),  # v
+            predictions[:, 2:3].cpu().numpy(),  # p
+            predictions[:, 3:4].cpu().numpy()   # T
         )
     
     def plot_results(self, t: float, save_path: str = None) -> None:
@@ -207,14 +223,14 @@ class FlowDeepONet:
         T = T.reshape((nx, ny))
         
         # Create figure
-        fig = plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(15, 10))
         
         # Velocity magnitude plot
         plt.subplot(2, 2, 1)
         vel_mag = np.sqrt(u**2 + v**2)
         plt.contourf(X, Y, vel_mag, levels=50, cmap='RdYlBu_r')
         plt.colorbar(label='Velocity Magnitude (m/s)')
-        plt.streamplot(x, y, u, v, color='k', density=1.5)
+        plt.streamplot(x, y, u.T, v.T, color='k', density=1.5)
         plt.title('Velocity Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
@@ -274,5 +290,5 @@ if __name__ == "__main__":
             model.plot_results(t, save_path=f'flow_field_t{t:.1f}.png')
             
     except Exception as e:
-        logger.error(f"Error in main execution: {str(e)}")
+        logger.error(f"Error in main execution: {str(e)}", exc_info=True)
         raise
