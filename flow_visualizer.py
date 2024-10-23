@@ -25,10 +25,18 @@ class FlowVisualizer:
         
     def _create_mesh(self, nx: int = 100, ny: int = 50) -> tuple:
         """Create a mesh for visualization."""
+        print("\nCreating mesh...")
         x = torch.linspace(0, self.L, nx, device=self.device)
         y = torch.linspace(0, self.H, ny, device=self.device)
+        print(f"x range: [{x[0].item():.6f}, {x[-1].item():.6f}], length: {len(x)}")
+        print(f"y range: [{y[0].item():.6f}, {y[-1].item():.6f}], length: {len(y)}")
+        
         X, Y = torch.meshgrid(x, y, indexing='ij')
+        print(f"X shape after meshgrid: {X.shape}")
+        print(f"Y shape after meshgrid: {Y.shape}")
+        
         xy = torch.stack([X.flatten(), Y.flatten()], dim=1)
+        print(f"xy shape: {xy.shape}\n")
         return X, Y, xy
     
     def _compute_vorticity(self, u: np.ndarray, v: np.ndarray, 
@@ -57,25 +65,17 @@ class FlowVisualizer:
                        nx: int = 100, ny: int = 50) -> plt.Figure:
         """
         Plot the flow field at a specific time.
-        
-        Args:
-            model: Trained FlowPINN model
-            t: Time at which to visualize the flow
-            title: Plot title
-            save_path: Optional path to save the figure
-            nx: Number of points in x direction
-            ny: Number of points in y direction
-        
-        Returns:
-            matplotlib Figure object
         """
         model.eval()
         X, Y, xy = self._create_mesh(nx, ny)
         t_tensor = torch.full((xy.shape[0], 1), t, device=self.device)
+        print(f"Time tensor shape: {t_tensor.shape}")
         
         # Get predictions
         with torch.no_grad():
             u, v, p, T = model.predict(xy, t_tensor)
+            print(f"\nPrediction shapes:")
+            print(f"u: {u.shape}, v: {v.shape}, p: {p.shape}, T: {T.shape}")
         
         # Reshape predictions and convert to numpy
         u = u.reshape(nx, ny).cpu().numpy()
@@ -85,9 +85,24 @@ class FlowVisualizer:
         X = X.cpu().numpy()
         Y = Y.cpu().numpy()
         
+        print(f"\nArray shapes after reshape:")
+        print(f"u: {u.shape}, v: {v.shape}")
+        print(f"X: {X.shape}, Y: {Y.shape}")
+        
         # Calculate grid spacing
         dx = X[1, 0] - X[0, 0]
         dy = Y[0, 1] - Y[0, 0]
+        print(f"\nGrid spacing - dx: {dx:.6f}, dy: {dy:.6f}")
+        
+        # Create meshgrid for streamplot
+        x_1d = np.linspace(0, self.L, nx)
+        y_1d = np.linspace(0, self.H, ny)
+        X_stream, Y_stream = np.meshgrid(x_1d, y_1d)
+        
+        print(f"\nStreamplot grid shapes:")
+        print(f"X_stream: {X_stream.shape}, Y_stream: {Y_stream.shape}")
+        print("Sample X_stream first row:", X_stream[0, :3])
+        print("Sample Y_stream first column:", Y_stream[:3, 0])
         
         # Create figure with subplots
         fig = plt.figure(figsize=self.figsize)
@@ -98,12 +113,18 @@ class FlowVisualizer:
         vel_plot = plt.contourf(X, Y, vel_mag, levels=50, cmap=self.cmap)
         plt.colorbar(vel_plot, label='Velocity Magnitude (m/s)')
         
-        # Add streamlines with proper handling
-        skip = 2  # Reduce density of streamlines
-        plt.streamplot(X[::skip, ::skip], Y[::skip, ::skip],
-                      u[::skip, ::skip], v[::skip, ::skip],
+        # Add streamlines
+        # Transpose arrays for streamplot
+        u_stream = u.T
+        v_stream = v.T
+        print(f"\nStreamplot input shapes:")
+        print(f"u_stream: {u_stream.shape}, v_stream: {v_stream.shape}")
+        
+        plt.streamplot(X_stream[0, :], Y_stream[:, 0],
+                      u_stream, v_stream,
                       color='k', density=1.5, linewidth=0.5,
                       arrowsize=0.5)
+        
         plt.title('Velocity Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
@@ -124,10 +145,9 @@ class FlowVisualizer:
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
         
-        # Vorticity plot with improved calculation
+        # Vorticity plot
         plt.subplot(2, 2, 4)
         vorticity = self._compute_vorticity(u, v, dx, dy)
-        # Use symmetric limits for vorticity plot
         vmax = np.max(np.abs(vorticity))
         v_plot = plt.contourf(X, Y, vorticity, levels=50,
                              cmap='RdBu', vmin=-vmax, vmax=vmax)
@@ -148,21 +168,16 @@ class FlowVisualizer:
                         save_path: str, nx: int = 100, ny: int = 50) -> None:
         """
         Create an animation of the flow field over time.
-        
-        Args:
-            model: Trained FlowPINN model
-            t_range: Array of time points to animate
-            save_path: Path to save the animation
-            nx: Number of points in x direction
-            ny: Number of points in y direction
         """
         fig = plt.figure(figsize=self.figsize)
         
         X, Y, xy = self._create_mesh(nx, ny)
         X = X.cpu().numpy()
         Y = Y.cpu().numpy()
-        dx = X[1, 0] - X[0, 0]
-        dy = Y[0, 1] - Y[0, 0]
+        
+        # Create 1D arrays for streamplot
+        x_1d = np.linspace(0, self.L, nx)
+        y_1d = np.linspace(0, self.H, ny)
         
         def update(frame):
             plt.clf()
@@ -179,10 +194,7 @@ class FlowVisualizer:
             plt.contourf(X, Y, vel_mag, levels=50, cmap=self.cmap)
             plt.colorbar(label='Velocity Magnitude (m/s)')
             
-            # Add streamlines with reduced density
-            skip = 2
-            plt.streamplot(X[::skip, ::skip], Y[::skip, ::skip],
-                         u[::skip, ::skip], v[::skip, ::skip],
+            plt.streamplot(x_1d, y_1d, u.T, v.T,
                          color='k', density=1.5, linewidth=0.5,
                          arrowsize=0.5)
             
@@ -198,13 +210,6 @@ class FlowVisualizer:
     def plot_history(self, loss_history: dict, save_path: Optional[str] = None) -> plt.Figure:
         """
         Plot training history.
-        
-        Args:
-            loss_history: Dictionary containing loss values over epochs
-            save_path: Optional path to save the figure
-        
-        Returns:
-            matplotlib Figure object
         """
         fig = plt.figure(figsize=(10, 6))
         epochs = range(1, len(loss_history['total_loss']) + 1)
