@@ -92,74 +92,69 @@ class FlowDeepONet(nn.Module):
     def forward(self, sensor_data: torch.Tensor, coords: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         logger.debug(f"Forward pass input shapes - sensor_data: {sensor_data.shape}, coords: {coords.shape}, t: {t.shape}")
         
-        # Ensure sensor_data is on the correct device
+        # Ensure sensor_data is on the correct device and has the right shape
         sensor_data = sensor_data.to(self.device)
         coords = coords.to(self.device)
         t = t.to(self.device)
         
-        # Ensure sensor_data has batch dimension
+        # Reshape sensor_data if necessary
         if sensor_data.dim() == 1:
             sensor_data = sensor_data.unsqueeze(0)
-            logger.debug(f"Added batch dimension to sensor_data: {sensor_data.shape}")
         
-        # Combine coordinates and time
-        inputs = torch.cat([coords, t], dim=1)
-        logger.debug(f"Combined inputs shape: {inputs.shape}")
-
-        # Expand sensor data if necessary to match coords batch size
+        # Expand sensor_data to match batch size if needed
         if sensor_data.size(0) == 1 and coords.size(0) > 1:
             sensor_data = sensor_data.expand(coords.size(0), -1)
-            logger.debug(f"Expanded sensor_data shape: {sensor_data.shape}")
-
+            
+        # Combine coordinates and time
+        inputs = torch.cat([coords, t], dim=1)
+        
         # Branch outputs
         branch_u_out = self.branch_u(sensor_data)
         branch_v_out = self.branch_v(sensor_data)
         branch_p_out = self.branch_p(sensor_data)
         branch_T_out = self.branch_T(sensor_data)
         
-        logger.debug(f"Branch outputs shape: {branch_u_out.shape}")
-
         # Trunk outputs
         trunk_u_out = self.trunk_u(inputs)
         trunk_v_out = self.trunk_v(inputs)
         trunk_p_out = self.trunk_p(inputs)
         trunk_T_out = self.trunk_T(inputs)
         
-        logger.debug(f"Trunk outputs shape: {trunk_u_out.shape}")
-
-        # DeepONet dot product for each variable
+        # DeepONet dot product
         u = torch.sum(branch_u_out * trunk_u_out, dim=-1, keepdim=True)
         v = torch.sum(branch_v_out * trunk_v_out, dim=-1, keepdim=True)
         p = torch.sum(branch_p_out * trunk_p_out, dim=-1, keepdim=True)
         T = torch.sum(branch_T_out * trunk_T_out, dim=-1, keepdim=True)
-        
-        logger.debug(f"Final output shapes - u: {u.shape}, v: {v.shape}, p: {p.shape}, T: {T.shape}")
 
         return u, v, p, T
 
-    def generate_sensor_data(self) -> torch.Tensor:
+    def generate_sensor_data(self, batch_size: int = 1) -> torch.Tensor:
         """Generate synthetic sensor data for training."""
         logger.info("Generating synthetic sensor data")
         
-        # Generate sensor positions
+        # Create a grid of sensor positions
         x_sensors = torch.linspace(0, self.L, self.n_sensors, device=self.device)
         y_sensors = torch.linspace(0, self.H, self.n_sensors, device=self.device)
         X, Y = torch.meshgrid(x_sensors, y_sensors, indexing='ij')
         
-        # Generate synthetic measurements for each variable
+        # Generate synthetic measurements for each variable with batch dimension
         U = torch.sin(2 * np.pi * X / self.L) * torch.cos(2 * np.pi * Y / self.H)
         V = -torch.cos(2 * np.pi * X / self.L) * torch.sin(2 * np.pi * Y / self.H)
         P = torch.sin(2 * np.pi * X / self.L) * torch.sin(2 * np.pi * Y / self.H)
         T = 300 + 20 * torch.sin(np.pi * Y / self.H)
         
-        # Flatten and combine all measurements
+        # Flatten the spatial dimensions
         sensor_data = torch.cat([
             U.flatten(),
             V.flatten(),
             P.flatten(),
             T.flatten()
-        ])
+        ]).unsqueeze(0)  # Add batch dimension
         
+        # Expand to batch size if needed
+        if batch_size > 1:
+            sensor_data = sensor_data.expand(batch_size, -1)
+            
         logger.debug(f"Generated sensor data shape: {sensor_data.shape}")
         return sensor_data
 
@@ -325,8 +320,8 @@ def train_model(model: FlowDeepONet, num_epochs: int = 10000, batch_size: int = 
     
     logger.info(f"Generated training points - Total points: {coords.shape[0]}")
     
-    # Generate sensor data
-    sensor_data = model.generate_sensor_data()
+    # Generate sensor data with matching batch size
+    sensor_data = model.generate_sensor_data(batch_size=batch_size)
     logger.info(f"Generated sensor data shape: {sensor_data.shape}")
     
     # Initialize loss history
@@ -358,8 +353,11 @@ def train_model(model: FlowDeepONet, num_epochs: int = 10000, batch_size: int = 
                 coords_batch = coords_shuffled[start_idx:end_idx]
                 t_batch = t_train_shuffled[start_idx:end_idx]
                 
+                # Get corresponding sensor data batch
+                sensor_batch = sensor_data[:end_idx-start_idx]
+                
                 # Compute loss
-                loss, loss_dict = model.compute_loss(sensor_data, coords_batch, t_batch)
+                loss, loss_dict = model.compute_loss(sensor_batch, coords_batch, t_batch)
                 
                 # Backward pass and optimization
                 loss.backward()
@@ -436,7 +434,7 @@ def test_model(model: FlowDeepONet, domain_params: Dict[str, float], t: float) -
         vel_mag = np.sqrt(u**2 + v**2)
         plt.contourf(X_np, Y_np, vel_mag, levels=50, cmap='RdYlBu_r')
         plt.colorbar(label='Velocity Magnitude (m/s)')
-        plt.streamplot(X_np, Y_np, u, v, color='k', density=1.5)
+        plt.streamplot(X_np[0, :], Y_np[:, 0], u.T, v.T, color='k', density=1.5)
         plt.title('Velocity Field')
         plt.xlabel('x (m)')
         plt.ylabel('y (m)')
