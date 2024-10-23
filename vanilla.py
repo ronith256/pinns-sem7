@@ -30,6 +30,10 @@ class VanillaPINN(nn.Module):
     
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         try:
+            # Ensure inputs require gradients
+            x = x.clone().detach().requires_grad_(True)
+            t = t.clone().detach().requires_grad_(True)
+            
             # Ensure inputs are on the same device as the model
             device = next(self.parameters()).device
             x = x.to(device)
@@ -51,16 +55,21 @@ class VanillaPINN(nn.Module):
             outputs = self.network(inputs)
             
             # Split outputs into velocity components, pressure, and temperature
-            u = outputs[:, 0:1]
-            v = outputs[:, 1:2]
-            p = outputs[:, 2:3]
-            T = outputs[:, 3:4]
+            # Ensure outputs maintain gradient information
+            u = outputs[:, 0:1].clone()
+            v = outputs[:, 1:2].clone()
+            p = outputs[:, 2:3].clone()
+            T = outputs[:, 3:4].clone()
+            
+            # Verify gradients are enabled
+            assert u.requires_grad and v.requires_grad and p.requires_grad and T.requires_grad
             
             return u, v, p, T
             
         except Exception as e:
             print(f"Error in forward pass: {str(e)}")
-            return (torch.zeros(x.shape[0], 1, device=device),) * 4
+            zeros = torch.zeros(x.shape[0], 1, device=device, requires_grad=True)
+            return zeros, zeros, zeros, zeros
 
 class VanillaPINNSolver:
     def __init__(self, domain_params: dict, physics_params: dict):
