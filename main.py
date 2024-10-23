@@ -59,7 +59,7 @@ def compare_and_analyze_models():
     #         if epoch % 100 == 0:
     #             print(f"Epoch {epoch}, Loss: {loss:.6f}")
     #     training_histories[name] = history
-    for name, solver in solver.items():
+    for name, solver in solvers.items():
         history = solver.train(epochs)
         training_histories[name] = history
 
