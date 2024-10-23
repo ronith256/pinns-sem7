@@ -36,43 +36,52 @@ class FlowDeepONet(nn.Module):
         super().__init__()
         
         # Physical parameters
-        self.rho = 997.07  # Density of water
-        self.mu = 8.9e-4   # Dynamic viscosity
-        self.nu = self.mu / self.rho  # Kinematic viscosity
-        self.k = 0.606     # Thermal conductivity
-        self.cp = 4200     # Specific heat capacity
-        self.q_flux = 20000  # Heat flux
+        self.rho = 997.07
+        self.mu = 8.9e-4
+        self.nu = self.mu / self.rho
+        self.k = 0.606
+        self.cp = 4200
+        self.q_flux = 20000
         
         # Domain parameters
         self.L = domain_params['L']
         self.H = domain_params['H']
-        self.Re = 200      # Reynolds number
-        
-        # Calculate inlet velocity from Reynolds number
-        self.Dh = 0.00116  # Hydraulic diameter
+        self.Re = 200
+        self.Dh = 0.00116
         self.U_in = (self.Re * self.mu) / (self.rho * self.Dh)
 
         # Network parameters
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        hidden_dim = 256
-        output_dim = 64
+        self.hidden_dim = 256
+        self.output_dim = 64
+        
+        # Number of sensor points for each variable
+        self.n_sensors = 10  # Number of sensors per variable
+        sensor_dim = self.n_sensors * 4  # Total sensors for u, v, p, T
 
-        # Branch and Trunk networks for each variable (u, v, p, T)
-        # Branch networks take sensor data as input
-        self.branch_u = BranchNet(100, hidden_dim, output_dim).to(self.device)  # 100 sensor points
-        self.branch_v = BranchNet(100, hidden_dim, output_dim).to(self.device)
-        self.branch_p = BranchNet(100, hidden_dim, output_dim).to(self.device)
-        self.branch_T = BranchNet(100, hidden_dim, output_dim).to(self.device)
+        # Branch and Trunk networks for each variable
+        self.branch_u = BranchNet(sensor_dim, self.hidden_dim, self.output_dim).to(self.device)
+        self.branch_v = BranchNet(sensor_dim, self.hidden_dim, self.output_dim).to(self.device)
+        self.branch_p = BranchNet(sensor_dim, self.hidden_dim, self.output_dim).to(self.device)
+        self.branch_T = BranchNet(sensor_dim, self.hidden_dim, self.output_dim).to(self.device)
 
         # Trunk networks take coordinates (x, y, t) as input
-        self.trunk_u = TrunkNet(3, hidden_dim, output_dim).to(self.device)
-        self.trunk_v = TrunkNet(3, hidden_dim, output_dim).to(self.device)
-        self.trunk_p = TrunkNet(3, hidden_dim, output_dim).to(self.device)
-        self.trunk_T = TrunkNet(3, hidden_dim, output_dim).to(self.device)
+        self.trunk_u = TrunkNet(3, self.hidden_dim, self.output_dim).to(self.device)
+        self.trunk_v = TrunkNet(3, self.hidden_dim, self.output_dim).to(self.device)
+        self.trunk_p = TrunkNet(3, self.hidden_dim, self.output_dim).to(self.device)
+        self.trunk_T = TrunkNet(3, self.hidden_dim, self.output_dim).to(self.device)
 
     def forward(self, sensor_data: torch.Tensor, coords: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        # Ensure sensor_data has batch dimension
+        if sensor_data.dim() == 1:
+            sensor_data = sensor_data.unsqueeze(0)
+        
         # Combine coordinates and time
         inputs = torch.cat([coords, t], dim=1)
+
+        # Expand sensor data if necessary to match coords batch size
+        if sensor_data.size(0) == 1 and coords.size(0) > 1:
+            sensor_data = sensor_data.expand(coords.size(0), -1)
 
         # Branch outputs
         branch_u_out = self.branch_u(sensor_data)
@@ -87,10 +96,10 @@ class FlowDeepONet(nn.Module):
         trunk_T_out = self.trunk_T(inputs)
 
         # DeepONet dot product for each variable
-        u = torch.sum(branch_u_out.unsqueeze(1) * trunk_u_out, dim=-1, keepdim=True)
-        v = torch.sum(branch_v_out.unsqueeze(1) * trunk_v_out, dim=-1, keepdim=True)
-        p = torch.sum(branch_p_out.unsqueeze(1) * trunk_p_out, dim=-1, keepdim=True)
-        T = torch.sum(branch_T_out.unsqueeze(1) * trunk_T_out, dim=-1, keepdim=True)
+        u = torch.sum(branch_u_out * trunk_u_out, dim=-1, keepdim=True)
+        v = torch.sum(branch_v_out * trunk_v_out, dim=-1, keepdim=True)
+        p = torch.sum(branch_p_out * trunk_p_out, dim=-1, keepdim=True)
+        T = torch.sum(branch_T_out * trunk_T_out, dim=-1, keepdim=True)
 
         return u, v, p, T
 
@@ -231,23 +240,29 @@ class FlowDeepONet(nn.Module):
         
         return total_loss, loss_dict
 
-def generate_sensor_data(nx: int = 10, ny: int = 10) -> torch.Tensor:
+def generate_sensor_data(model: FlowDeepONet) -> torch.Tensor:
     """Generate synthetic sensor data for training."""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    x = torch.linspace(0, 0.029, nx)
-    y = torch.linspace(0, 0.00058, ny)
-    X, Y = torch.meshgrid(x, y, indexing='ij')
+    device = model.device
+    n_sensors = model.n_sensors
     
-    # Generate some synthetic flow data (example)
-    U = torch.sin(2 * np.pi * X / 0.029) * torch.cos(2 * np.pi * Y / 0.00058)
-    V = -torch.cos(2 * np.pi * X / 0.029) * torch.sin(2 * np.pi * Y / 0.00058)
-    P = torch.sin(2 * np.pi * X / 0.029) * torch.sin(2 * np.pi * Y / 0.00058)
-    T = 300 + 20 * torch.sin(np.pi * Y / 0.00058)
+    # Generate sensor positions
+    x_sensors = torch.linspace(0, model.L, n_sensors, device=device)
+    y_sensors = torch.linspace(0, model.H, n_sensors, device=device)
+    X, Y = torch.meshgrid(x_sensors, y_sensors, indexing='ij')
     
+    # Generate synthetic measurements for each variable
+    U = torch.sin(2 * np.pi * X / model.L) * torch.cos(2 * np.pi * Y / model.H)
+    V = -torch.cos(2 * np.pi * X / model.L) * torch.sin(2 * np.pi * Y / model.H)
+    P = torch.sin(2 * np.pi * X / model.L) * torch.sin(2 * np.pi * Y / model.H)
+    T = 300 + 20 * torch.sin(np.pi * Y / model.H)
+    
+    # Flatten and combine all measurements
     sensor_data = torch.cat([
-        U.flatten(), V.flatten(), 
-        P.flatten(), T.flatten()
-    ]).to(device)
+        U.flatten(),
+        V.flatten(),
+        P.flatten(),
+        T.flatten()
+    ])
     
     return sensor_data
 
@@ -265,7 +280,7 @@ def train_model(model: FlowDeepONet, num_epochs: int = 10000):
     t_train = T.flatten().unsqueeze(1)
     
     # Generate sensor data
-    sensor_data = generate_sensor_data()
+    sensor_data = generate_sensor_data(model)
     
     # Initialize loss history
     loss_history = {
@@ -279,10 +294,7 @@ def train_model(model: FlowDeepONet, num_epochs: int = 10000):
         model.train()
         optimizer.zero_grad()
         
-        # Compute loss
         loss, loss_dict = model.compute_loss(sensor_data, coords, t_train)
-        
-        # Backward pass and optimization
         loss.backward()
         optimizer.step()
         
@@ -384,23 +396,5 @@ if __name__ == "__main__":
     print("Training DeepONet model...")
     trained_model, loss_history = train_model(model, num_epochs=1000)
     
-    # Test model at different times
-    print("\nTesting model...")
-    test_times = [0.0, 15.0, 30.0]
-    for t in test_times:
-        print(f"\nGenerating results for t = {t}s")
-        test_model(trained_model, domain_params, t)
-    
-    # Plot training history
-    import matplotlib.pyplot as plt
-    epochs = range(1, len(loss_history['total_loss']) + 1)
-    plt.figure(figsize=(10, 6))
-    plt.semilogy(epochs, loss_history['total_loss'], label='Total Loss')
-    plt.semilogy(epochs, loss_history['pde_loss'], label='PDE Loss')
-    plt.semilogy(epochs, loss_history['bc_loss'], label='BC Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training History')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # Test model
+    test_model(trained_model, domain_params, t=15.0)
