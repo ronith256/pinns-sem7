@@ -4,27 +4,70 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, List
 from utils import *
 
-class VanillaPINN(nn.Module):
-    def __init__(self, layers: List[int] = [3, 128, 128, 128, 128, 4]):
+class ResidualBlock(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
-        self.layers = layers
+        self.linear1 = nn.Linear(dim, dim)
+        self.linear2 = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
         
-        # Build the neural network with batch normalization and proper initialization
-        modules = []
-        for i in range(len(layers)-1):
-            modules.append(nn.Linear(layers[i], layers[i+1]))
-            if i < len(layers)-2:
-                modules.append(nn.BatchNorm1d(layers[i+1]))
-                modules.append(nn.Tanh())
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x = self.norm1(x)
+        x = F.silu(x)  # SiLU/Swish activation for better gradient flow
+        x = self.linear1(x)
+        x = self.norm2(x)
+        x = F.silu(x)
+        x = self.linear2(x)
+        return x + identity
+
+class VanillaPINN(nn.Module):
+    def __init__(self, input_dim: int = 3, hidden_dim: int = 256, num_blocks: int = 4):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(input_dim)
         
-        self.network = nn.Sequential(*modules)
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
+        )
         
-        # Initialize weights using Xavier initialization
+        # Residual blocks
+        self.blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim) for _ in range(num_blocks)
+        ])
+        
+        # Output heads with separate networks for better specialization
+        self.velocity_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 2)  # u, v
+        )
+        
+        self.pressure_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1)  # p
+        )
+        
+        self.temperature_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1)  # T
+        )
+        
+        # Initialize weights carefully
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.xavier_normal_(module.weight, gain=0.1)
+            # Smaller initialization for better gradient flow
+            nn.init.xavier_uniform_(module.weight, gain=0.1)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
     
@@ -35,33 +78,49 @@ class VanillaPINN(nn.Module):
             x = x.to(device)
             t = t.to(device)
             
-            # Normalize inputs to improve training stability
-            x_mean = torch.mean(x, dim=0, keepdim=True)
-            x_std = torch.std(x, dim=0, keepdim=True) + 1e-8
-            x_normalized = (x - x_mean) / x_std
+            # Compute normalization statistics for current batch
+            x_mean = x.mean(dim=0, keepdim=True)
+            x_std = x.std(dim=0, keepdim=True) + 1e-8
+            t_mean = t.mean()
+            t_std = t.std() + 1e-8
             
-            t_mean = torch.mean(t)
-            t_std = torch.std(t) + 1e-8
+            # Normalize inputs
+            x_normalized = (x - x_mean) / x_std
             t_normalized = (t - t_mean) / t_std
             
-            # Combine normalized spatial coordinates and time
+            # Combine inputs
             inputs = torch.cat([x_normalized, t_normalized.reshape(-1, 1)], dim=1)
             
-            # Get network output
-            outputs = self.network(inputs)
+            # Input normalization and projection
+            x = self.input_norm(inputs)
+            x = self.input_proj(x)
             
-            # Split outputs into velocity components, pressure, and temperature
-            u = outputs[:, 0:1]
-            v = outputs[:, 1:2]
-            p = outputs[:, 2:3]
-            T = outputs[:, 3:4]
+            # Process through residual blocks
+            for block in self.blocks:
+                x = block(x)
+            
+            # Get outputs from different heads
+            velocity = self.velocity_head(x)
+            pressure = self.pressure_head(x)
+            temperature = self.temperature_head(x)
+            
+            # Split velocity into components
+            u = velocity[:, 0:1]
+            v = velocity[:, 1:2]
+            p = pressure
+            T = temperature
+            
+            # Scale outputs to reasonable ranges
+            u = u * 0.1  # Velocity scaling
+            v = v * 0.1
+            p = p * 100  # Pressure scaling
+            T = T * 10 + 300  # Temperature scaling with offset
             
             return u, v, p, T
             
         except Exception as e:
             print(f"Error in forward pass: {str(e)}")
-            zeros = torch.zeros(x.shape[0], 1, device=device, requires_grad=True)
-            return zeros, zeros, zeros, zeros
+            return (torch.zeros(x.shape[0], 1, device=device),) * 4
 
 class VanillaPINNSolver:
     def __init__(self, domain_params: dict, physics_params: dict):
@@ -73,43 +132,45 @@ class VanillaPINNSolver:
         self.Re = domain_params['Re']
         self.Q_flux = domain_params['Q_flux']
         
-        # Initialize model and move to device
+        # Initialize model
         self.model = VanillaPINN().to(self.device)
         self.physics_loss = PhysicsLoss(**physics_params).to(self.device)
         
-        # Initialize optimizer with gradient clipping
-        self.optimizer = torch.optim.AdamW(
+        # Use Adam optimizer with gradient clipping
+        self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=1e-4,
-            weight_decay=1e-5,
             betas=(0.9, 0.999),
             eps=1e-8
         )
         
-        # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        # Cosine annealing scheduler with warm restarts
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=500,
-            verbose=True,
-            min_lr=1e-6
+            T_0=1000,
+            T_mult=2,
+            eta_min=1e-6
         )
         
-        # Loss weights
+        # Dynamic loss weights
         self.loss_weights = {
             'continuity': 1.0,
             'momentum_x': 1.0,
             'momentum_y': 1.0,
-            'energy': 1.0,
-            'boundary': 10.0
+            'energy': 0.1,  # Reduced weight for energy equation
+            'boundary': 10.0  # Increased weight for boundary conditions
         }
         
         # Initialize best model tracking
         self.best_loss = float('inf')
         self.best_model_state = None
         
+        # Loss history for adaptive weighting
+        self.loss_history = []
+        self.adaptation_interval = 100
+        
     def to(self, device: torch.device) -> 'VanillaPINNSolver':
+        """Move solver to specified device"""
         self.device = device
         self.model = self.model.to(device)
         self.physics_loss = self.physics_loss.to(device)
@@ -118,35 +179,40 @@ class VanillaPINNSolver:
     def compute_gradients(self, u: torch.Tensor, v: torch.Tensor,
                          p: torch.Tensor, T: torch.Tensor,
                          x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Compute spatial and temporal gradients"""
+        """Compute spatial and temporal gradients with improved stability"""
         try:
-            # Create computation graph
-            x.requires_grad_(True)
-            t.requires_grad_(True)
+            # Enable gradient computation
+            x = x.requires_grad_(True)
+            t = t.requires_grad_(True)
             
-            # Recompute outputs with gradients enabled
-            u_pred, v_pred, p_pred, T_pred = self.model(x, t)
+            def grad(y: torch.Tensor, x: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
+                """Compute gradient with stability checks"""
+                g = compute_gradient(y, x, allow_unused=True)
+                if g is None:
+                    return torch.zeros_like(x)
+                # Clip gradients to prevent explosions
+                return torch.clamp(g, min=-100, max=100)
             
-            # First derivatives
-            u_x = torch.autograd.grad(u_pred.sum(), x, create_graph=True)[0][:, 0:1]
-            u_y = torch.autograd.grad(u_pred.sum(), x, create_graph=True)[0][:, 1:2]
-            v_x = torch.autograd.grad(v_pred.sum(), x, create_graph=True)[0][:, 0:1]
-            v_y = torch.autograd.grad(v_pred.sum(), x, create_graph=True)[0][:, 1:2]
-            T_x = torch.autograd.grad(T_pred.sum(), x, create_graph=True)[0][:, 0:1]
-            T_y = torch.autograd.grad(T_pred.sum(), x, create_graph=True)[0][:, 1:2]
+            # First derivatives with gradient clipping
+            u_x = grad(u.sum(), x)[:, 0:1]
+            u_y = grad(u.sum(), x)[:, 1:2]
+            v_x = grad(v.sum(), x)[:, 0:1]
+            v_y = grad(v.sum(), x)[:, 1:2]
+            T_x = grad(T.sum(), x)[:, 0:1]
+            T_y = grad(T.sum(), x)[:, 1:2]
             
             # Second derivatives
-            u_xx = torch.autograd.grad(u_x.sum(), x, create_graph=True)[0][:, 0:1]
-            u_yy = torch.autograd.grad(u_y.sum(), x, create_graph=True)[0][:, 1:2]
-            v_xx = torch.autograd.grad(v_x.sum(), x, create_graph=True)[0][:, 0:1]
-            v_yy = torch.autograd.grad(v_y.sum(), x, create_graph=True)[0][:, 1:2]
-            T_xx = torch.autograd.grad(T_x.sum(), x, create_graph=True)[0][:, 0:1]
-            T_yy = torch.autograd.grad(T_y.sum(), x, create_graph=True)[0][:, 1:2]
+            u_xx = grad(u_x.sum(), x)[:, 0:1]
+            u_yy = grad(u_y.sum(), x)[:, 1:2]
+            v_xx = grad(v_x.sum(), x)[:, 0:1]
+            v_yy = grad(v_y.sum(), x)[:, 1:2]
+            T_xx = grad(T_x.sum(), x)[:, 0:1]
+            T_yy = grad(T_y.sum(), x)[:, 1:2]
             
             # Time derivatives
-            u_t = torch.autograd.grad(u_pred.sum(), t, create_graph=True)[0]
-            v_t = torch.autograd.grad(v_pred.sum(), t, create_graph=True)[0]
-            T_t = torch.autograd.grad(T_pred.sum(), t, create_graph=True)[0]
+            u_t = grad(u.sum(), t)
+            v_t = grad(v.sum(), t)
+            T_t = grad(T.sum(), t)
             
             return u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t
             
@@ -155,95 +221,63 @@ class VanillaPINNSolver:
             zeros = torch.zeros_like(x[:, 0:1])
             return tuple([zeros] * 15)
 
-    def compute_inlet_velocity(self) -> torch.Tensor:
-        """Compute inlet velocity based on Reynolds number"""
-        return (self.Re * self.physics_loss.mu / 
-                (self.physics_loss.rho * self.H)).to(self.device)
+    def update_loss_weights(self, losses: dict):
+        """Dynamically adjust loss weights based on their relative magnitudes"""
+        if len(self.loss_history) >= self.adaptation_interval:
+            # Compute average losses over the interval
+            avg_losses = {
+                k: sum(hist[k] for hist in self.loss_history) / len(self.loss_history)
+                for k in losses.keys() if k != 'total'
+            }
+            
+            # Update weights inversely proportional to loss magnitudes
+            max_loss = max(avg_losses.values())
+            for k in self.loss_weights.keys():
+                if k in avg_losses and avg_losses[k] > 0:
+                    self.loss_weights[k] = max_loss / avg_losses[k]
+            
+            # Normalize weights
+            total_weight = sum(self.loss_weights.values())
+            for k in self.loss_weights:
+                self.loss_weights[k] /= total_weight
+                
+            # Clear history
+            self.loss_history = []
+        else:
+            self.loss_history.append(losses)
 
-    def boundary_loss(self, x_b: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Compute boundary condition loss with device handling"""
-        x_b = x_b.to(self.device).requires_grad_(True)
-        t = t.to(self.device).requires_grad_(True)
-        
-        try:
-            u, v, p, T = self.model(x_b, t)
-            
-            # Inlet conditions (x = 0)
-            inlet_mask = (x_b[:, 0] == 0)
-            u_in = self.compute_inlet_velocity()
-            inlet_loss = (
-                torch.mean(torch.square(u[inlet_mask] - u_in)) +
-                torch.mean(torch.square(v[inlet_mask])) +
-                torch.mean(torch.square(T[inlet_mask] - 300))
-            )
-            
-            # Wall conditions (y = 0 or y = H)
-            wall_mask = (x_b[:, 1] == 0) | (x_b[:, 1] == self.H)
-            wall_loss = (
-                torch.mean(torch.square(u[wall_mask])) +
-                torch.mean(torch.square(v[wall_mask]))
-            )
-            
-            # Bottom wall heat flux condition
-            bottom_wall_mask = (x_b[:, 1] == 0)
-            if torch.any(bottom_wall_mask):
-                T_masked = T[bottom_wall_mask]
-                if T_masked.requires_grad:
-                    T_grad = compute_gradient(T_masked.sum(), x_b, allow_unused=True)
-                    if T_grad is not None:
-                        heat_flux_loss = torch.mean(torch.square(
-                            -self.physics_loss.k * T_grad[:, 1] - self.Q_flux
-                        ))
-                    else:
-                        heat_flux_loss = torch.tensor(0.0, device=self.device)
-                else:
-                    heat_flux_loss = torch.tensor(0.0, device=self.device)
-            else:
-                heat_flux_loss = torch.tensor(0.0, device=self.device)
-            
-            return inlet_loss + wall_loss + heat_flux_loss
-            
-        except Exception as e:
-            print(f"Error computing boundary loss: {str(e)}")
-            return torch.tensor(float('inf'), device=self.device)
-        
     def train_step(self, x_domain: torch.Tensor, x_boundary: torch.Tensor,
                   t_domain: torch.Tensor, t_boundary: torch.Tensor) -> dict:
         """Perform one training step with improved stability"""
         self.model.train()
-        self.optimizer.zero_grad()
-        
-        # Move inputs to device
-        x_domain = x_domain.to(self.device)
-        t_domain = t_domain.to(self.device)
-        x_boundary = x_boundary.to(self.device)
-        t_boundary = t_boundary.to(self.device)
+        self.optimizer.zero_grad(set_to_none=True)
         
         try:
-            # Forward pass with gradient computation
+            # Forward pass
             u, v, p, T = self.model(x_domain, t_domain)
             
             # Compute gradients
             grads = self.compute_gradients(u, v, p, T, x_domain, t_domain)
             u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t = grads
             
-            # Compute individual losses with weights and gradient masking
-            losses = {
-                'continuity': self.loss_weights['continuity'] * self.physics_loss.continuity_loss(
-                    u, v, lambda x: u_x, lambda x: v_y),
-                'momentum_x': self.loss_weights['momentum_x'] * self.physics_loss.momentum_x_loss(
-                    u, v, p, lambda x: u_x, lambda x: u_y,
-                    lambda x: u_xx, lambda x: u_yy, u_t),
-                'momentum_y': self.loss_weights['momentum_y'] * self.physics_loss.momentum_y_loss(
-                    u, v, p, lambda x: v_x, lambda x: v_y,
-                    lambda x: v_xx, lambda x: v_yy, v_t),
-                'energy': self.loss_weights['energy'] * self.physics_loss.energy_loss(
-                    T, u, v, lambda x: T_x, lambda x: T_y,
-                    lambda x: T_xx, lambda x: T_yy, T_t),
-                'boundary': self.loss_weights['boundary'] * self.boundary_loss(x_boundary, t_boundary)
-            }
+            # Compute individual losses with gradient masking
+            with torch.cuda.amp.autocast(enabled=True):
+                losses = {
+                    'continuity': self.loss_weights['continuity'] * self.physics_loss.continuity_loss(
+                        u, v, lambda x: u_x, lambda x: v_y),
+                    'momentum_x': self.loss_weights['momentum_x'] * self.physics_loss.momentum_x_loss(
+                        u, v, p, lambda x: u_x, lambda x: u_y,
+                        lambda x: u_xx, lambda x: u_yy, u_t),
+                    'momentum_y': self.loss_weights['momentum_y'] * self.physics_loss.momentum_y_loss(
+                        u, v, p, lambda x: v_x, lambda x: v_y,
+                        lambda x: v_xx, lambda x: v_yy, v_t),
+                    'energy': self.loss_weights['energy'] * self.physics_loss.energy_loss(
+                        T, u, v, lambda x: T_x, lambda x: T_y,
+                        lambda x: T_xx, lambda x: T_yy, T_t),
+                    'boundary': self.loss_weights['boundary'] * self.boundary_loss(x_boundary, t_boundary)
+                }
             
-            # Compute total loss with loss scaling for stability
+            # Compute total loss with loss scaling
             total_loss = sum(losses.values())
             
             # Check for invalid loss values
@@ -256,6 +290,9 @@ class VanillaPINNSolver:
             
             # Optimizer step
             self.optimizer.step()
+            
+            # Update loss weights
+            self.update_loss_weights({k: v.item() for k, v in losses.items()})
             
             # Convert losses to float for logging
             losses = {k: v.item() for k, v in losses.items()}
