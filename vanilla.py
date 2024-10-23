@@ -110,19 +110,19 @@ class VanillaPINNSolver:
     def compute_inlet_velocity(self):
         """Compute inlet velocity based on Reynolds number"""
         return self.Re * self.physics_loss.mu / (self.physics_loss.rho * self.H)
-
-    def train_step(self, x_domain, x_boundary, t):
+    
+    def train_step(self, x_domain, x_boundary, t_domain, t_boundary):
         self.optimizer.zero_grad()
         
         # Ensure inputs require gradients
         x_domain.requires_grad_(True)
-        t.requires_grad_(True)
+        t_domain.requires_grad_(True)
         
         # Forward pass for domain points
-        u, v, p, T = self.model(x_domain, t)
+        u, v, p, T = self.model(x_domain, t_domain)
         
         # Compute gradients
-        grads = self.compute_gradients(u, v, p, T, x_domain, t)
+        grads = self.compute_gradients(u, v, p, T, x_domain, t_domain)
         u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t = grads
         
         # Physics losses
@@ -134,8 +134,8 @@ class VanillaPINNSolver:
         energy = self.physics_loss.energy_loss(T, u, v, lambda x: T_x, lambda x: T_y,
                                              lambda x: T_xx, lambda x: T_yy, T_t)
         
-        # Boundary losses
-        bc_loss = self.boundary_loss(x_boundary, t)
+        # Boundary losses using boundary time tensor
+        bc_loss = self.boundary_loss(x_boundary, t_boundary)
         
         # Total loss
         loss = continuity + momentum_x + momentum_y + energy + bc_loss
@@ -146,13 +146,17 @@ class VanillaPINNSolver:
         return loss.item()
 
     def train(self, epochs, nx=501, ny=51):
+        # Create domain and boundary points
         x_domain = create_domain_points(nx, ny, self.L, self.H)
         x_boundary = create_boundary_points(nx, ny, self.L, self.H)
-        t = torch.zeros(x_domain.shape[0], 1)
+        
+        # Create time tensors with matching batch sizes
+        t_domain = torch.zeros(x_domain.shape[0], 1)
+        t_boundary = torch.zeros(x_boundary.shape[0], 1)
         
         losses = []
         for epoch in range(epochs):
-            loss = self.train_step(x_domain, x_boundary, t)
+            loss = self.train_step(x_domain, x_boundary, t_domain, t_boundary)
             losses.append(loss)
             if epoch % 100 == 0:
                 print(f"Epoch {epoch}, Loss: {loss:.6f}")

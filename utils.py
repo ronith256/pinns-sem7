@@ -42,25 +42,20 @@ def create_domain_points(nx, ny, L, H):
     return torch.tensor(np.stack([X.flatten(), Y.flatten()], axis=1), dtype=torch.float32)
 
 def create_boundary_points(nx, ny, L, H):
-    """Create boundary points for BC enforcement"""
-    # Inlet (x = 0)
-    x_inlet = np.zeros(ny)
-    y_inlet = np.linspace(0, H, ny)
-    inlet = np.stack([x_inlet, y_inlet], axis=1)
+    """Create boundary points for BC enforcement with proper ordering"""
+    # Calculate number of points for each boundary
+    n_inlet = ny  # Points on inlet
+    n_outlet = ny  # Points on outlet
+    n_bottom = nx  # Points on bottom wall
+    n_top = nx     # Points on top wall
     
-    # Outlet (x = L)
-    x_outlet = np.ones(ny) * L
-    y_outlet = np.linspace(0, H, ny)
-    outlet = np.stack([x_outlet, y_outlet], axis=1)
+    # Create boundary points arrays
+    inlet_points = torch.tensor([(0, y) for y in np.linspace(0, H, ny)], dtype=torch.float32)
+    outlet_points = torch.tensor([(L, y) for y in np.linspace(0, H, ny)], dtype=torch.float32)
+    bottom_points = torch.tensor([(x, 0) for x in np.linspace(0, L, nx)], dtype=torch.float32)
+    top_points = torch.tensor([(x, H) for x in np.linspace(0, L, nx)], dtype=torch.float32)
     
-    # Bottom wall (y = 0)
-    x_bottom = np.linspace(0, L, nx)
-    y_bottom = np.zeros(nx)
-    bottom = np.stack([x_bottom, y_bottom], axis=1)
+    # Combine all boundary points
+    boundary_points = torch.cat([inlet_points, outlet_points, bottom_points, top_points], dim=0)
     
-    # Top wall (y = H)
-    x_top = np.linspace(0, L, nx)
-    y_top = np.ones(nx) * H
-    top = np.stack([x_top, y_top], axis=1)
-    
-    return torch.tensor(np.vstack([inlet, outlet, bottom, top]), dtype=torch.float32)
+    return boundary_points

@@ -189,10 +189,11 @@ class FNOPINNSolver:
     def train(self, epochs, nx=501, ny=51):
         x_domain = create_domain_points(nx, ny, self.L, self.H)
         x_boundary = create_boundary_points(nx, ny, self.L, self.H)
-        t = torch.zeros(x_domain.shape[0], 1)
+        t_domain = torch.zeros(x_domain.shape[0], 1)
+        t_boundary = torch.zeros(x_boundary.shape[0], 1)
         history = []
         for epoch in range(epochs):
-            loss = self.train_step(x_domain, x_boundary, t)
+            loss = self.train_step(x_domain, x_boundary, t_domain, t_boundary)
             history.append(loss)
             if epoch % 100 == 0:
                 print(f"Epoch {epoch}, Loss: {loss:.6f}")
