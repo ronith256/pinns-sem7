@@ -29,32 +29,37 @@ class FlowVisualizer:
         x_flat, t_tensor = self.create_input_tensor(t, device)
         u, v, p, T = model.predict(x_flat, t_tensor)
         
-        # Move predictions to CPU for plotting
-        u = u.cpu().numpy().reshape(self.ny, self.nx)
-        v = v.cpu().numpy().reshape(self.ny, self.nx)
-        p = p.cpu().numpy().reshape(self.ny, self.nx)
-        T = T.cpu().numpy().reshape(self.ny, self.nx)
+        # Move predictions to CPU and reshape
+        # Reshape to (nx, ny) and transpose for correct orientation
+        u = u.cpu().numpy().reshape(self.ny, self.nx).T
+        v = v.cpu().numpy().reshape(self.ny, self.nx).T
+        p = p.cpu().numpy().reshape(self.ny, self.nx).T
+        T = T.cpu().numpy().reshape(self.ny, self.nx).T
         
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
         fig.suptitle(f'{title} at t = {t:.2f}s')
         
+        # Create X, Y grids for plotting that match the reshaped data
+        X, Y = np.meshgrid(self.x, self.y, indexing='ij')
+        
         # Velocity magnitude
         vel_mag = np.sqrt(u**2 + v**2)
-        im1 = ax1.pcolormesh(self.X, self.Y, vel_mag, shading='auto')
+        im1 = ax1.pcolormesh(X, Y, vel_mag, shading='auto')
         ax1.set_title('Velocity Magnitude')
         plt.colorbar(im1, ax=ax1)
         
         # Streamlines
-        ax2.streamplot(self.x, self.y, u.T, v.T, density=1.5)
+        # Note: For streamplot, we need to use the original grid coordinates
+        ax2.streamplot(self.x, self.y, u, v, density=1.5)
         ax2.set_title('Streamlines')
         
         # Pressure
-        im3 = ax3.pcolormesh(self.X, self.Y, p, shading='auto')
+        im3 = ax3.pcolormesh(X, Y, p, shading='auto')
         ax3.set_title('Pressure')
         plt.colorbar(im3, ax=ax3)
         
         # Temperature
-        im4 = ax4.pcolormesh(self.X, self.Y, T, shading='auto')
+        im4 = ax4.pcolormesh(X, Y, T, shading='auto')
         ax4.set_title('Temperature')
         plt.colorbar(im4, ax=ax4)
         
@@ -72,16 +77,19 @@ class FlowVisualizer:
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
         device = next(model.parameters()).device
         
+        # Create X, Y grids for plotting
+        X, Y = np.meshgrid(self.x, self.y, indexing='ij')
+        
         def update(frame):
             t = t_range[frame]
             x_flat, t_tensor = self.create_input_tensor(t, device)
             u, v, p, T = model.predict(x_flat, t_tensor)
             
-            # Move results to CPU for plotting
-            u = u.cpu().numpy().reshape(self.ny, self.nx)
-            v = v.cpu().numpy().reshape(self.ny, self.nx)
-            p = p.cpu().numpy().reshape(self.ny, self.nx)
-            T = T.cpu().numpy().reshape(self.ny, self.nx)
+            # Move results to CPU and reshape
+            u = u.cpu().numpy().reshape(self.ny, self.nx).T
+            v = v.cpu().numpy().reshape(self.ny, self.nx).T
+            p = p.cpu().numpy().reshape(self.ny, self.nx).T
+            T = T.cpu().numpy().reshape(self.ny, self.nx).T
             
             # Clear previous plots
             for ax in (ax1, ax2, ax3, ax4):
@@ -89,16 +97,16 @@ class FlowVisualizer:
             
             # Update plots
             vel_mag = np.sqrt(u**2 + v**2)
-            ax1.pcolormesh(self.X, self.Y, vel_mag, shading='auto')
+            ax1.pcolormesh(X, Y, vel_mag, shading='auto')
             ax1.set_title('Velocity Magnitude')
             
-            ax2.streamplot(self.x, self.y, u.T, v.T, density=1.5)
+            ax2.streamplot(self.x, self.y, u, v, density=1.5)
             ax2.set_title('Streamlines')
             
-            ax3.pcolormesh(self.X, self.Y, p, shading='auto')
+            ax3.pcolormesh(X, Y, p, shading='auto')
             ax3.set_title('Pressure')
             
-            ax4.pcolormesh(self.X, self.Y, T, shading='auto')
+            ax4.pcolormesh(X, Y, T, shading='auto')
             ax4.set_title('Temperature')
             
             for ax in (ax1, ax2, ax3, ax4):
@@ -121,23 +129,26 @@ class FlowVisualizer:
         n_models = len(models)
         fig = plt.figure(figsize=(15, 4*n_models))
         
+        # Create X, Y grids for plotting
+        X, Y = np.meshgrid(self.x, self.y, indexing='ij')
+        
         for i, (name, model) in enumerate(models.items()):
             device = next(model.parameters()).device
             x_flat, t_tensor = self.create_input_tensor(t, device)
             u, v, p, T = model.predict(x_flat, t_tensor)
             
-            # Move results to CPU for plotting
-            u = u.cpu().numpy().reshape(self.ny, self.nx)
-            v = v.cpu().numpy().reshape(self.ny, self.nx)
+            # Move results to CPU and reshape
+            u = u.cpu().numpy().reshape(self.ny, self.nx).T
+            v = v.cpu().numpy().reshape(self.ny, self.nx).T
             vel_mag = np.sqrt(u**2 + v**2)
             
             ax1 = fig.add_subplot(n_models, 2, 2*i + 1)
-            im1 = ax1.pcolormesh(self.X, self.Y, vel_mag, shading='auto')
+            im1 = ax1.pcolormesh(X, Y, vel_mag, shading='auto')
             ax1.set_title(f'{name} - Velocity Magnitude')
             plt.colorbar(im1, ax=ax1)
             
             ax2 = fig.add_subplot(n_models, 2, 2*i + 2)
-            ax2.streamplot(self.x, self.y, u.T, v.T, density=1.5)
+            ax2.streamplot(self.x, self.y, u, v, density=1.5)
             ax2.set_title(f'{name} - Streamlines')
             
             for ax in (ax1, ax2):
