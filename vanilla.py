@@ -30,10 +30,6 @@ class VanillaPINN(nn.Module):
     
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         try:
-            # Ensure inputs require gradients
-            x = x.clone().detach().requires_grad_(True)
-            t = t.clone().detach().requires_grad_(True)
-            
             # Ensure inputs are on the same device as the model
             device = next(self.parameters()).device
             x = x.to(device)
@@ -55,14 +51,10 @@ class VanillaPINN(nn.Module):
             outputs = self.network(inputs)
             
             # Split outputs into velocity components, pressure, and temperature
-            # Ensure outputs maintain gradient information
-            u = outputs[:, 0:1].clone()
-            v = outputs[:, 1:2].clone()
-            p = outputs[:, 2:3].clone()
-            T = outputs[:, 3:4].clone()
-            
-            # Verify gradients are enabled
-            assert u.requires_grad and v.requires_grad and p.requires_grad and T.requires_grad
+            u = outputs[:, 0:1]
+            v = outputs[:, 1:2]
+            p = outputs[:, 2:3]
+            T = outputs[:, 3:4]
             
             return u, v, p, T
             
@@ -85,7 +77,7 @@ class VanillaPINNSolver:
         self.model = VanillaPINN().to(self.device)
         self.physics_loss = PhysicsLoss(**physics_params).to(self.device)
         
-        # Use AdamW optimizer with weight decay and gradient clipping
+        # Initialize optimizer with gradient clipping
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=1e-4,
@@ -94,7 +86,7 @@ class VanillaPINNSolver:
             eps=1e-8
         )
         
-        # Learning rate scheduler with reduce on plateau strategy
+        # Learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='min',
@@ -104,21 +96,20 @@ class VanillaPINNSolver:
             min_lr=1e-6
         )
         
-        # Loss weights for balancing different terms
+        # Loss weights
         self.loss_weights = {
             'continuity': 1.0,
             'momentum_x': 1.0,
             'momentum_y': 1.0,
             'energy': 1.0,
-            'boundary': 10.0  # Increased weight for boundary conditions
+            'boundary': 10.0
         }
         
         # Initialize best model tracking
         self.best_loss = float('inf')
         self.best_model_state = None
-
+        
     def to(self, device: torch.device) -> 'VanillaPINNSolver':
-        """Move solver to specified device"""
         self.device = device
         self.model = self.model.to(device)
         self.physics_loss = self.physics_loss.to(device)
@@ -127,35 +118,35 @@ class VanillaPINNSolver:
     def compute_gradients(self, u: torch.Tensor, v: torch.Tensor,
                          p: torch.Tensor, T: torch.Tensor,
                          x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Compute spatial and temporal gradients with proper device handling"""
-        x = x.to(self.device).requires_grad_(True)
-        t = t.to(self.device).requires_grad_(True)
-        
+        """Compute spatial and temporal gradients"""
         try:
-            def grad(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-                """Helper function for gradient computation"""
-                return compute_gradient(y, x, allow_unused=True)
+            # Create computation graph
+            x.requires_grad_(True)
+            t.requires_grad_(True)
+            
+            # Recompute outputs with gradients enabled
+            u_pred, v_pred, p_pred, T_pred = self.model(x, t)
             
             # First derivatives
-            u_x = grad(u.sum(), x)[:, 0:1]
-            u_y = grad(u.sum(), x)[:, 1:2]
-            v_x = grad(v.sum(), x)[:, 0:1]
-            v_y = grad(v.sum(), x)[:, 1:2]
-            T_x = grad(T.sum(), x)[:, 0:1]
-            T_y = grad(T.sum(), x)[:, 1:2]
+            u_x = torch.autograd.grad(u_pred.sum(), x, create_graph=True)[0][:, 0:1]
+            u_y = torch.autograd.grad(u_pred.sum(), x, create_graph=True)[0][:, 1:2]
+            v_x = torch.autograd.grad(v_pred.sum(), x, create_graph=True)[0][:, 0:1]
+            v_y = torch.autograd.grad(v_pred.sum(), x, create_graph=True)[0][:, 1:2]
+            T_x = torch.autograd.grad(T_pred.sum(), x, create_graph=True)[0][:, 0:1]
+            T_y = torch.autograd.grad(T_pred.sum(), x, create_graph=True)[0][:, 1:2]
             
             # Second derivatives
-            u_xx = grad(u_x.sum(), x)[:, 0:1]
-            u_yy = grad(u_y.sum(), x)[:, 1:2]
-            v_xx = grad(v_x.sum(), x)[:, 0:1]
-            v_yy = grad(v_y.sum(), x)[:, 1:2]
-            T_xx = grad(T_x.sum(), x)[:, 0:1]
-            T_yy = grad(T_y.sum(), x)[:, 1:2]
+            u_xx = torch.autograd.grad(u_x.sum(), x, create_graph=True)[0][:, 0:1]
+            u_yy = torch.autograd.grad(u_y.sum(), x, create_graph=True)[0][:, 1:2]
+            v_xx = torch.autograd.grad(v_x.sum(), x, create_graph=True)[0][:, 0:1]
+            v_yy = torch.autograd.grad(v_y.sum(), x, create_graph=True)[0][:, 1:2]
+            T_xx = torch.autograd.grad(T_x.sum(), x, create_graph=True)[0][:, 0:1]
+            T_yy = torch.autograd.grad(T_y.sum(), x, create_graph=True)[0][:, 1:2]
             
             # Time derivatives
-            u_t = grad(u.sum(), t)
-            v_t = grad(v.sum(), t)
-            T_t = grad(T.sum(), t)
+            u_t = torch.autograd.grad(u_pred.sum(), t, create_graph=True)[0]
+            v_t = torch.autograd.grad(v_pred.sum(), t, create_graph=True)[0]
+            T_t = torch.autograd.grad(T_pred.sum(), t, create_graph=True)[0]
             
             return u_x, u_y, v_x, v_y, T_x, T_y, u_xx, u_yy, v_xx, v_yy, T_xx, T_yy, u_t, v_t, T_t
             
