@@ -62,10 +62,10 @@ def compare_and_analyze_models():
 
     # Initialize solvers with device
     solvers = {
-        'Vanilla PINN': VanillaPINNSolver(domain_params, physics_params).to(device),
-        'DeepONet': DeepONetPINNSolver(domain_params, physics_params).to(device),
-        'NSFNet': NSFNetSolver(domain_params, physics_params).to(device),
-        'FNO': FNOPINNSolver(domain_params, physics_params).to(device)
+        'Vanilla PINN': VanillaPINNSolver(domain_params, physics_params).to(device)
+        # 'DeepONet': DeepONetPINNSolver(domain_params, physics_params).to(device),
+        # 'NSFNet': NSFNetSolver(domain_params, physics_params).to(device),
+        # 'FNO': FNOPINNSolver(domain_params, physics_params).to(device)
     }
 
     # Dictionary to store training histories
