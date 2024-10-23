@@ -39,7 +39,7 @@ class FlowDeepONet:
         
         # Initialize the model
         self._setup_geometry()
-        self._setup_pde()
+        self._setup_training_data()
         self._create_model()
         
     def _setup_geometry(self):
@@ -53,62 +53,49 @@ class FlowDeepONet:
         # Spatio-temporal domain
         self.geomtime = dde.geometry.GeometryXTime(self.geom, self.timedomain)
         
-    def _setup_pde(self):
-        """Set up the PDE system."""
-        def pde(x, y):
-            """
-            Define the PDE system.
-            x: input coordinates (x, y, t)
-            y: network output (u, v, p, T)
-            """
-            u, v, p, T = y[:, 0:1], y[:, 1:2], y[:, 2:3], y[:, 3:4]
-            
-            # Get derivatives
-            du_x = dde.grad.jacobian(y, x, i=0, j=0)
-            du_y = dde.grad.jacobian(y, x, i=0, j=1)
-            du_t = dde.grad.jacobian(y, x, i=0, j=2)
-            du_xx = dde.grad.hessian(y, x, i=0, j=0)
-            du_yy = dde.grad.hessian(y, x, i=0, j=1)
-            
-            dv_x = dde.grad.jacobian(y, x, i=1, j=0)
-            dv_y = dde.grad.jacobian(y, x, i=1, j=1)
-            dv_t = dde.grad.jacobian(y, x, i=1, j=2)
-            dv_xx = dde.grad.hessian(y, x, i=1, j=0)
-            dv_yy = dde.grad.hessian(y, x, i=1, j=1)
-            
-            dp_x = dde.grad.jacobian(y, x, i=2, j=0)
-            dp_y = dde.grad.jacobian(y, x, i=2, j=1)
-            
-            dT_x = dde.grad.jacobian(y, x, i=3, j=0)
-            dT_y = dde.grad.jacobian(y, x, i=3, j=1)
-            dT_t = dde.grad.jacobian(y, x, i=3, j=2)
-            dT_xx = dde.grad.hessian(y, x, i=3, j=0)
-            dT_yy = dde.grad.hessian(y, x, i=3, j=1)
-            
-            # Continuity equation
-            continuity = du_x + dv_y
-            
-            # Momentum equations
-            momentum_x = (du_t + u * du_x + v * du_y + 
-                        (1/self.rho) * dp_x - self.nu * (du_xx + du_yy))
-            
-            momentum_y = (dv_t + u * dv_x + v * dv_y + 
-                        (1/self.rho) * dp_y - self.nu * (dv_xx + dv_yy))
-            
-            # Energy equation
-            energy = (dT_t + u * dT_x + v * dT_y - 
-                     (self.k/(self.rho * self.cp)) * (dT_xx + dT_yy))
-            
-            return [continuity, momentum_x, momentum_y, energy]
+    def _generate_sensor_locations(self):
+        """Generate sensor locations for training data."""
+        nx_sensors = 10
+        ny_sensors = 5
         
-        self.pde = pde
+        x = np.linspace(0, self.L, nx_sensors)
+        y = np.linspace(0, self.H, ny_sensors)
+        t = np.linspace(0, 30, 10)
+        
+        X, Y, T = np.meshgrid(x, y, t)
+        sensor_locations = np.stack([X.flatten(), Y.flatten(), T.flatten()], axis=1)
+        
+        return sensor_locations
+        
+    def _setup_training_data(self):
+        """Set up training data for DeepONet."""
+        # Generate sensor locations
+        sensor_locations = self._generate_sensor_locations()
+        
+        # Generate synthetic data at sensor locations
+        def analytical_solution(x, y, t):
+            """Simple analytical solution for testing."""
+            u = self.U_in * (1 - np.exp(-0.1 * t)) * (1 - (y/self.H)**2)
+            v = np.zeros_like(u)
+            p = self.rho * self.U_in**2 * (1 - x/self.L)
+            T = 300 + 20 * (y/self.H)
+            return np.stack([u, v, p, T], axis=1)
+        
+        sensor_data = analytical_solution(
+            sensor_locations[:, 0],
+            sensor_locations[:, 1],
+            sensor_locations[:, 2]
+        )
+        
+        # Create training data
+        self.train_x = sensor_locations
+        self.train_y = sensor_data
         
     def _create_model(self):
         """Create the DeepONet model."""
         # Define branch and trunk nets
-        branch_net = dde.nn.DeepONetCartesianProd(
-            [self.n_branch, self.n_branch, self.n_branch, self.n_branch],
-            [128, 128, 128],
+        branch_net = dde.nn.FNN(
+            [self.train_x.shape[1]] + [128] * 3 + [self.n_branch],
             "tanh",
             "Glorot normal"
         )
@@ -119,86 +106,42 @@ class FlowDeepONet:
             "Glorot normal"
         )
         
+        # Create data
+        data = dde.data.TripleCartesianProd(
+            X_train=self.train_x,
+            y_train=self.train_y,
+            X_test=None
+        )
+        
         # Create DeepONet
         self.net = dde.nn.DeepONet(
-            branch_net,
-            trunk_net,
-            self.pde,
-            self.geomtime,
-            num_domain=10000,
-            num_boundary=2000,
-            num_initial=1000,
-            num_test=1000
+            branch_net=branch_net,
+            trunk_net=trunk_net,
+            data=data,
+            output_dim=4
         )
         
-        # Add boundary conditions
-        def inlet_bc(x, on_boundary):
-            return on_boundary and np.isclose(x[0], 0)
+        # Create loss function combining data loss and physics constraints
+        def custom_loss(inputs, outputs, model):
+            loss_data = torch.mean((outputs - model(inputs))**2)
+            
+            # Add physics-based constraints
+            x, y, t = inputs[:, 0:1], inputs[:, 1:2], inputs[:, 2:3]
+            u, v, p, T = outputs[:, 0:1], outputs[:, 1:2], outputs[:, 2:3], outputs[:, 3:4]
+            
+            # Compute derivatives
+            du_dx = dde.grad.jacobian(u, x)
+            dv_dy = dde.grad.jacobian(v, y)
+            
+            # Continuity equation
+            loss_continuity = torch.mean((du_dx + dv_dy)**2)
+            
+            # Simplified momentum and energy constraints
+            loss_physics = loss_continuity
+            
+            return loss_data + 0.1 * loss_physics
         
-        def outlet_bc(x, on_boundary):
-            return on_boundary and np.isclose(x[0], self.L)
-        
-        def bottom_bc(x, on_boundary):
-            return on_boundary and np.isclose(x[1], 0)
-        
-        def top_bc(x, on_boundary):
-            return on_boundary and np.isclose(x[1], self.H)
-        
-        # Inlet conditions
-        self.net.add_boundary_condition(
-            lambda x: self.U_in - dde.grad.jacobian(self.net(x), x, i=0, j=0),
-            inlet_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: dde.grad.jacobian(self.net(x), x, i=1, j=0),
-            inlet_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: 300 - self.net(x)[:, 3:4],
-            inlet_bc
-        )
-        
-        # Outlet conditions
-        self.net.add_boundary_condition(
-            lambda x: dde.grad.jacobian(self.net(x), x, i=0, j=0),
-            outlet_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: dde.grad.jacobian(self.net(x), x, i=1, j=0),
-            outlet_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: dde.grad.jacobian(self.net(x), x, i=3, j=0),
-            outlet_bc
-        )
-        
-        # Bottom wall conditions
-        self.net.add_boundary_condition(
-            lambda x: self.net(x)[:, 0:1],
-            bottom_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: self.net(x)[:, 1:2],
-            bottom_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: -self.k * dde.grad.jacobian(self.net(x), x, i=3, j=1) - self.q_flux,
-            bottom_bc
-        )
-        
-        # Top wall conditions
-        self.net.add_boundary_condition(
-            lambda x: self.net(x)[:, 0:1],
-            top_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: self.net(x)[:, 1:2],
-            top_bc
-        )
-        self.net.add_boundary_condition(
-            lambda x: dde.grad.jacobian(self.net(x), x, i=3, j=1),
-            top_bc
-        )
+        self.net.compile("adam", lr=1e-3, loss=custom_loss)
         
     def train(self, epochs: int = 10000) -> Dict:
         """
@@ -212,21 +155,12 @@ class FlowDeepONet:
         """
         logger.info(f"Starting training for {epochs} epochs")
         
-        # Create optimizer
-        optimizer = torch.optim.Adam(self.net.parameters(), lr=1e-3)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=100, verbose=True
-        )
-        
-        # Train the model
-        loss_history = self.net.train(
-            optimizer=optimizer,
-            scheduler=scheduler,
+        losshistory, train_state = self.net.train(
             epochs=epochs,
             display_every=100
         )
         
-        return loss_history
+        return losshistory
     
     def predict(self, x_star: np.ndarray) -> Tuple[np.ndarray, ...]:
         """
